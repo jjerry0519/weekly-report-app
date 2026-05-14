@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import concurrent.futures
 import html
 import json
 import os
@@ -25,6 +26,9 @@ SOURCE_DIR = BASE_DIR / "sources"
 TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_PATH = TEMPLATE_DIR / "同業送件明細樣板.xlsx"
 SFB_PAGE = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
+REPORT_WINDOW_DAYS = 7
+ENABLE_ONLINE_MOPS_LOOKUP = os.environ.get("ENABLE_ONLINE_MOPS_LOOKUP", "1").lower() in {"1", "true", "yes", "on"}
+MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "6"))
 
 COMPANY_TYPES = ("上市", "上櫃")
 CASE_KEYWORDS = (
@@ -58,7 +62,11 @@ def latest_thursday(today: dt.date | None = None) -> dt.date:
 
 def default_week(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
     end = latest_thursday(today)
-    return end - dt.timedelta(days=6), end
+    return report_window(end)
+
+
+def report_window(end: dt.date) -> tuple[dt.date, dt.date]:
+    return end - dt.timedelta(days=REPORT_WINDOW_DAYS - 1), end
 
 
 def roc_date(date: dt.date, sep: str = "/") -> str:
@@ -438,6 +446,19 @@ def display_name_for_record(record: dict[str, str]) -> str:
     return company
 
 
+def online_mops_lookup(record: dict[str, str], end: dt.date, need_name: bool, need_purpose: bool) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if need_name:
+        name = mops_bond_short_name(record, end)
+        if name:
+            result["name"] = name
+    if need_purpose:
+        purpose = mops_funding_purpose(record, end)
+        if purpose:
+            result["purpose"] = purpose
+    return result
+
+
 def enrich_records(
     records: list[dict[str, str]],
     end: dt.date | None = None,
@@ -446,6 +467,7 @@ def enrich_records(
 ) -> list[str]:
     warnings: list[str] = []
     end = end or latest_thursday()
+    lookup_jobs: list[tuple[dict[str, str], tuple[str, str, str], bool, bool]] = []
     for record in records:
         key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
         data = MOPS_ENRICHMENTS.get(key)
@@ -456,20 +478,40 @@ def enrich_records(
             record["本次籌資計畫"] = data["purpose"]
         if focus_keys is not None and record_key(record) not in focus_keys:
             continue
-        if record.get("分類") in ("CB", "ECB", "EB"):
-            mops_name = mops_bond_short_name(record, end)
-            if mops_name:
-                record["顯示名稱"] = mops_name
-            elif key not in BOND_SHORT_NAMES:
-                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到債券商品簡稱，已先用公司簡稱。")
-        if purpose_keys is not None and record_key(record) not in purpose_keys:
+        need_name = record.get("分類") in ("CB", "ECB", "EB") and key not in BOND_SHORT_NAMES
+        need_purpose = (purpose_keys is None or record_key(record) in purpose_keys) and not record.get("本次籌資計畫", "").strip()
+        if not ENABLE_ONLINE_MOPS_LOOKUP:
+            if need_name and not data:
+                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未啟用線上 MOPS 補查，已先用公司簡稱。")
+            if need_purpose:
+                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未啟用線上 MOPS 補查，請人工確認本次籌資計畫。")
             continue
-        if not record.get("本次籌資計畫", "").strip():
-            purpose = mops_funding_purpose(record, end)
-            if purpose:
-                record["本次籌資計畫"] = purpose
-            else:
-                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查不到本次籌資計畫，請人工確認。")
+        if need_name or need_purpose:
+            lookup_jobs.append((record, key, need_name, need_purpose))
+    if ENABLE_ONLINE_MOPS_LOOKUP and lookup_jobs:
+        workers = max(1, min(MAX_MOPS_WORKERS, len(lookup_jobs)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(online_mops_lookup, record.copy(), end, need_name, need_purpose): (record, key, need_name, need_purpose)
+                for record, key, need_name, need_purpose in lookup_jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                record, key, need_name, need_purpose = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查詢失敗，請人工確認。{exc}")
+                    continue
+                if need_name:
+                    if result.get("name"):
+                        record["顯示名稱"] = result["name"]
+                    else:
+                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到債券商品簡稱，已先用公司簡稱。")
+                if need_purpose:
+                    if result.get("purpose"):
+                        record["本次籌資計畫"] = result["purpose"]
+                    else:
+                        warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查不到本次籌資計畫，請人工確認。")
     return warnings
 
 
@@ -1708,7 +1750,7 @@ HTML = """<!doctype html>
     </section>
     <section>
       <h2>手動上傳來源檔</h2>
-      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依 1150507 同業送件明細格式產出截至當日的 Excel 與 Email。</p>
+      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依 1150507 同業送件明細格式，產出截止日期前 7 天（含截止日）的 Excel 與 Email。</p>
       <div class="controls">
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" type="file" accept=".xlsx,.xls">
@@ -1742,6 +1784,21 @@ HTML = """<!doctype html>
       return d.toISOString().slice(0, 10);
     }
     endDate.value = latestThursday();
+
+    function reportRangeText() {
+      const end = new Date(`${endDate.value}T00:00:00`);
+      if (Number.isNaN(end.getTime())) return "";
+      const start = new Date(end);
+      start.setDate(start.getDate() - 6);
+      const fmt = d => d.toISOString().slice(0, 10);
+      return `處理區間：${fmt(start)} ～ ${fmt(end)}（含截止日，共 7 天）`;
+    }
+
+    function updateRangePreview() {
+      setStatus(reportRangeText());
+    }
+    updateRangePreview();
+    endDate.addEventListener("change", updateRangePreview);
 
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
@@ -1884,7 +1941,7 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             end_text = query.get("end", [""])[0]
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
-            start = end - dt.timedelta(days=6)
+            start, end = report_window(end)
             source_path, source_url = download_latest_source(end)
             result = build_report(source_path, start, end, source_url)
             self.send_json(200, result)
@@ -1896,7 +1953,7 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             end_text = query.get("end", [""])[0]
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
-            start = end - dt.timedelta(days=6)
+            start, end = report_window(end)
             source_path = self.save_uploaded_xlsx()
             result = build_report(source_path, start, end, "uploaded")
             self.send_json(200, result)
