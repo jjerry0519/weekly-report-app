@@ -1891,6 +1891,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+        def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.end_headers()
+
     def do_GET(self) -> None:
         ensure_dirs()
         parsed = urllib.parse.urlparse(self.path)
