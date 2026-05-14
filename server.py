@@ -1750,7 +1750,7 @@ HTML = """<!doctype html>
     </section>
     <section>
       <h2>手動上傳來源檔</h2>
-      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依 1150507 同業送件明細格式，產出截止日期前 7 天（含截止日）的 Excel 與 Email。</p>
+      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依同業送件明細樣板，產出截止日期前 7 天（含截止日）的 Excel 與 Email。</p>
       <div class="controls">
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" type="file" accept=".xlsx,.xls">
@@ -1786,12 +1786,12 @@ HTML = """<!doctype html>
     endDate.value = latestThursday();
 
     function reportRangeText() {
-      const end = new Date(`${endDate.value}T00:00:00`);
+      const end = new Date(endDate.value + "T00:00:00");
       if (Number.isNaN(end.getTime())) return "";
       const start = new Date(end);
       start.setDate(start.getDate() - 6);
       const fmt = d => d.toISOString().slice(0, 10);
-      return `處理區間：${fmt(start)} ～ ${fmt(end)}（含截止日，共 7 天）`;
+      return "處理區間：" + fmt(start) + " ～ " + fmt(end) + "（含截止日，共 7 天）";
     }
 
     function updateRangePreview() {
