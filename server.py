@@ -1783,7 +1783,12 @@ HTML = """<!doctype html>
       d.setDate(d.getDate() - diff);
       return d.toISOString().slice(0, 10);
     }
-    endDate.value = latestThursday();
+       endDate.value = latestThursday();
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (isError ? " error" : "");
+    }
 
     function reportRangeText() {
       const end = new Date(endDate.value + "T00:00:00");
@@ -1799,10 +1804,6 @@ HTML = """<!doctype html>
     }
     updateRangePreview();
     endDate.addEventListener("change", updateRangePreview);
-
-    function setStatus(text, isError = false) {
-      statusEl.textContent = text;
-      statusEl.className = "status" + (isError ? " error" : "");
     }
 
     function renderMetrics(counts) {
