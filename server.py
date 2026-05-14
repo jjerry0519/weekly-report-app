@@ -1892,7 +1892,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-        def do_HEAD(self) -> None:
+    def do_HEAD(self) -> None:
         self.send_response(200)
         self.end_headers()
 
