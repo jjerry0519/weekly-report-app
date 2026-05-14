@@ -1783,7 +1783,6 @@ HTML = """<!doctype html>
       d.setDate(d.getDate() - diff);
       return d.toISOString().slice(0, 10);
     }
-       endDate.value = latestThursday();
 
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
@@ -1802,9 +1801,6 @@ HTML = """<!doctype html>
     function updateRangePreview() {
       setStatus(reportRangeText());
     }
-    updateRangePreview();
-    endDate.addEventListener("change", updateRangePreview);
-    }
 
     function renderMetrics(counts) {
       metrics.hidden = false;
@@ -1812,10 +1808,10 @@ HTML = """<!doctype html>
         ["篩選後", counts.all],
         ["本週新增", counts.new],
         ["本週生效", counts.effective],
-        ["補正 / 停止", `${counts.amend} / ${counts.stop}`],
+        ["補正 / 停止", counts.amend + " / " + counts.stop],
         ["待補原因", counts.missingPurpose || 0],
         ["MOPS待確認", counts.lookupWarnings || 0],
-      ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
+      ].map(([label, value]) => '<div class="metric"><span>' + label + '</span><strong>' + value + '</strong></div>').join("");
     }
 
     async function loadReports() {
@@ -1830,9 +1826,9 @@ HTML = """<!doctype html>
           return;
         }
         list.className = "";
-        list.innerHTML = `<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>${
-          data.reports.map(r => `<tr><td>${r.file}</td><td>${r.modified}</td><td><a class="download" href="/download/${encodeURIComponent(r.file)}">下載 Excel</a></td></tr>`).join("")
-        }</tbody></table>`;
+        list.innerHTML = '<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>' +
+          data.reports.map(r => '<tr><td>' + r.file + '</td><td>' + r.modified + '</td><td><a class="download" href="/download/' + encodeURIComponent(r.file) + '">下載 Excel</a></td></tr>').join("") +
+          '</tbody></table>';
       } catch (err) {
         list.className = "empty";
         list.textContent = "檔案清單讀取失敗，請重新整理頁面。";
@@ -1853,15 +1849,15 @@ HTML = """<!doctype html>
       try {
         const form = new FormData();
         form.append("source", file);
-        const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
+        const res = await fetch("/api/generate-upload?end=" + encodeURIComponent(endDate.value), { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "產出失敗");
         renderMetrics(data.counts);
         emailBox.value = data.email || "";
         const warnings = (data.lookupWarnings || []).length
-          ? `\n\nMOPS 待確認：\n${data.lookupWarnings.join("\n")}`
+          ? "\n\nMOPS 待確認：\n" + data.lookupWarnings.join("\n")
           : "";
-        setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
+        setStatus("已產出：" + data.file + "\n週期：" + data.rocRange + warnings);
         await loadReports();
       } catch (err) {
         setStatus(err.message, true);
@@ -1870,10 +1866,15 @@ HTML = """<!doctype html>
       }
     });
 
+    endDate.value = latestThursday();
+    updateRangePreview();
+    endDate.addEventListener("change", updateRangePreview);
+
     loadReports().catch(err => {
       list.textContent = err.message;
     });
   </script>
+
 </body>
 </html>
 """
