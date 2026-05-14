@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: weekly-report-app
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    autoDeploy: true
+    healthCheckPath: /healthz

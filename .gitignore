@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Runtime uploads and generated outputs. These can contain company data.
+reports/
+sources/
+
+# Excel lock files
+~$*
+
+# Local editor / OS noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

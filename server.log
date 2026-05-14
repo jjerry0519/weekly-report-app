@@ -1,0 +1,9 @@
+[14/May/2026 15:33:53] "GET / HTTP/1.1" 200 -
+[14/May/2026 15:34:22] "POST /api/generate-upload?end=2026-05-14 HTTP/1.1" 200 -
+[14/May/2026 15:34:54] "GET / HTTP/1.1" 200 -
+[14/May/2026 15:34:57] "GET /api/reports HTTP/1.1" 200 -
+[14/May/2026 15:35:14] "POST /api/generate?end=2026-05-14 HTTP/1.1" 500 -
+[14/May/2026 15:36:25] "GET / HTTP/1.1" 200 -
+[14/May/2026 15:36:31] "POST /api/generate?end=2026-05-14 HTTP/1.1" 500 -
+[14/May/2026 15:37:15] "GET / HTTP/1.1" 200 -
+[14/May/2026 15:38:58] "GET / HTTP/1.1" 200 -
