@@ -1747,11 +1747,12 @@ HTML = """<!doctype html>
     <p>從證期局公開資料產出每週 Excel，免登入、免付費。</p>
   </div></header>
   <main><div class="wrap">
+    <form id="uploadForm" method="post" action="/api/generate-upload" enctype="multipart/form-data"></form>
     <section>
       <h2>設定截止日期</h2>
       <div class="controls">
         <label>截止週四
-          <input id="endDate" type="date">
+          <input id="endDate" name="end" form="uploadForm" type="date">
         </label>
       </div>
       <p id="status" class="status"></p>
@@ -1762,9 +1763,9 @@ HTML = """<!doctype html>
       <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依同業送件明細樣板，產出截止日期前 7 天（含截止日）的 Excel 與 Email。</p>
       <div class="controls">
         <label>證期局年度申報案件 Excel
-          <input id="sourceFile" type="file" accept=".xlsx,.xls">
+          <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls">
         </label>
-        <button id="uploadBtn" type="button">用上傳檔產出</button>
+        <button id="uploadBtn" form="uploadForm" type="submit">用上傳檔產出</button>
       </div>
     </section>
     <section>
@@ -1844,7 +1845,8 @@ HTML = """<!doctype html>
       }
     }
 
-    async function handleUpload() {
+    async function handleUpload(event) {
+      if (event) event.preventDefault();
       const file = sourceFile.files[0];
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
@@ -1984,18 +1986,65 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(exc)})
 
     def handle_upload_generate(self, parsed: urllib.parse.ParseResult) -> None:
+        accept = self.headers.get("Accept", "")
+        wants_html = "text/html" in accept and "application/json" not in accept
         try:
             query = urllib.parse.parse_qs(parsed.query)
-            end_text = query.get("end", [""])[0]
+            source_path, fields = self.save_uploaded_xlsx()
+            end_text = query.get("end", [""])[0] or fields.get("end", "")
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
             start, end = report_window(end)
-            source_path = self.save_uploaded_xlsx()
             result = build_report(source_path, start, end, "uploaded")
-            self.send_json(200, result)
+            if wants_html:
+                self.send_result_html(200, result)
+            else:
+                self.send_json(200, result)
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            if wants_html:
+                self.send_result_html(500, {"error": str(exc)})
+            else:
+                self.send_json(500, {"error": str(exc)})
 
-    def save_uploaded_xlsx(self) -> Path:
+    def send_result_html(self, status: int, payload: dict[str, object]) -> None:
+        if "error" in payload:
+            title = "產出失敗"
+            body_html = f"<p class='error'>{html.escape(str(payload.get('error', '產出失敗')))}</p><p><a href='/'>回首頁</a></p>"
+        else:
+            file_name = str(payload.get("file", ""))
+            email_text = str(payload.get("email", ""))
+            range_text = str(payload.get("rocRange", ""))
+            body_html = (
+                f"<p>已產出：{html.escape(file_name)}</p>"
+                f"<p>週期：{html.escape(range_text)}</p>"
+                f"<p><a class='download' href='/download/{urllib.parse.quote(file_name)}'>下載 Excel</a></p>"
+                f"<h2>Email 範本</h2><textarea readonly>{html.escape(email_text)}</textarea>"
+                "<p><a href='/'>回首頁</a></p>"
+            )
+            title = "產出完成"
+        page = f"""<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin:0; font-family:"Segoe UI","Microsoft JhengHei",sans-serif; color:#172033; background:#f7f8fa; }}
+    main {{ max-width: 920px; margin: 40px auto; padding: 24px; background:#fff; border:1px solid #d9dee8; border-radius:8px; }}
+    .download {{ display:inline-flex; padding:10px 14px; border-radius:6px; background:#12634f; color:#fff; text-decoration:none; font-weight:700; }}
+    textarea {{ width:100%; min-height:260px; border:1px solid #d9dee8; border-radius:8px; padding:12px; font:14px/1.6 Consolas,"Microsoft JhengHei",monospace; }}
+    .error {{ color:#b00020; white-space:pre-wrap; }}
+  </style>
+</head>
+<body><main><h1>{title}</h1>{body_html}</main></body>
+</html>"""
+        body = page.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def save_uploaded_xlsx(self) -> tuple[Path, dict[str, str]]:
         content_type = self.headers.get("Content-Type", "")
         match = re.search(r"boundary=(.+)", content_type)
         if not match:
@@ -2004,23 +2053,33 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         parts = body.split(b"--" + boundary)
+        fields: dict[str, str] = {}
+        uploaded_path: Path | None = None
         for part in parts:
-            if b"Content-Disposition:" not in part or b"filename=" not in part:
+            if b"Content-Disposition:" not in part:
                 continue
             header, _, data = part.partition(b"\r\n\r\n")
             if not data:
+                continue
+            name_match = re.search(rb'name="([^"]*)"', header)
+            field_name = name_match.group(1).decode("utf-8", errors="ignore") if name_match else ""
+            data = data.rstrip(b"\r\n")
+            if data.endswith(b"--"):
+                data = data[:-2].rstrip(b"\r\n")
+            if b"filename=" not in header:
+                if field_name:
+                    fields[field_name] = data.decode("utf-8", errors="ignore").strip()
                 continue
             filename_match = re.search(rb'filename="([^"]*)"', header)
             filename = filename_match.group(1).decode("utf-8", errors="ignore") if filename_match else "source.xlsx"
             filename = Path(filename).name or "source.xlsx"
             if not filename.lower().endswith((".xlsx", ".xls")):
                 raise ValueError("請上傳 Excel 檔。")
-            data = data.rstrip(b"\r\n")
-            if data.endswith(b"--"):
-                data = data[:-2].rstrip(b"\r\n")
             target = SOURCE_DIR / f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
             target.write_bytes(data)
-            return target
+            uploaded_path = target
+        if uploaded_path is not None:
+            return uploaded_path, fields
         raise ValueError("沒有收到 Excel 檔。")
 
 
