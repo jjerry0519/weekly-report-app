@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import concurrent.futures
 import html
 import json
 import os
@@ -25,6 +26,9 @@ SOURCE_DIR = BASE_DIR / "sources"
 TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_PATH = TEMPLATE_DIR / "同業送件明細樣板.xlsx"
 SFB_PAGE = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
+REPORT_WINDOW_DAYS = 7
+ENABLE_ONLINE_MOPS_LOOKUP = os.environ.get("ENABLE_ONLINE_MOPS_LOOKUP", "1").lower() in {"1", "true", "yes", "on"}
+MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "6"))
 
 COMPANY_TYPES = ("上市", "上櫃")
 CASE_KEYWORDS = (
@@ -58,7 +62,11 @@ def latest_thursday(today: dt.date | None = None) -> dt.date:
 
 def default_week(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
     end = latest_thursday(today)
-    return end - dt.timedelta(days=6), end
+    return report_window(end)
+
+
+def report_window(end: dt.date) -> tuple[dt.date, dt.date]:
+    return end - dt.timedelta(days=REPORT_WINDOW_DAYS - 1), end
 
 
 def roc_date(date: dt.date, sep: str = "/") -> str:
@@ -405,6 +413,36 @@ def parse_purpose_from_text(text: str) -> str:
     return "；".join(dict.fromkeys(purposes))
 
 
+def text_matches_record(text: str, record: dict[str, str]) -> bool:
+    compact = normalize_header(html_to_text(text))
+    if not compact:
+        return False
+    identities = [
+        record.get("證券代號", ""),
+        record.get("顯示名稱", ""),
+        record.get("公司名稱", ""),
+        display_name_for_record(record),
+    ]
+    identities = [normalize_header(item).replace("F-", "").replace("-KY", "") for item in identities if item]
+    has_identity = any(item and item in compact for item in identities)
+    if not has_identity:
+        return False
+    amount = re.sub(r"\D", "", record.get("金額", ""))
+    if not amount:
+        return True
+    amount_tokens = {amount}
+    try:
+        value = int(amount)
+        if value % 1000 == 0:
+            amount_tokens.add(str(value // 1000))
+        if value % 1000000 == 0:
+            amount_tokens.add(str(value // 1000000))
+    except ValueError:
+        pass
+    compact_digits = re.sub(r"\D", "", compact)
+    return any(token and token in compact_digits for token in amount_tokens)
+
+
 def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     params = {
@@ -417,12 +455,12 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
         "month": f"{received.month:02d}",
     }
     text = mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params)
-    purpose = parse_purpose_from_text(text)
+    purpose = parse_purpose_from_text(text) if text_matches_record(text, record) else ""
     if purpose:
         return purpose
     paths = ("/mops/web/ajax_t116sb01", "/mops/web/ajax_t108sb16")
     text = mops_query_text(paths, params)
-    return parse_purpose_from_text(text)
+    return parse_purpose_from_text(text) if text_matches_record(text, record) else ""
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -438,6 +476,19 @@ def display_name_for_record(record: dict[str, str]) -> str:
     return company
 
 
+def online_mops_lookup(record: dict[str, str], end: dt.date, need_name: bool, need_purpose: bool) -> dict[str, str]:
+    result: dict[str, str] = {}
+    if need_name:
+        name = mops_bond_short_name(record, end)
+        if name:
+            result["name"] = name
+    if need_purpose:
+        purpose = mops_funding_purpose(record, end)
+        if purpose:
+            result["purpose"] = purpose
+    return result
+
+
 def enrich_records(
     records: list[dict[str, str]],
     end: dt.date | None = None,
@@ -446,30 +497,53 @@ def enrich_records(
 ) -> list[str]:
     warnings: list[str] = []
     end = end or latest_thursday()
+    lookup_jobs: list[tuple[dict[str, str], tuple[str, str, str], bool, bool]] = []
     for record in records:
         key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
         data = MOPS_ENRICHMENTS.get(key)
+        wants_fresh_purpose = purpose_keys is None or record_key(record) in purpose_keys
         if not data:
             record["顯示名稱"] = display_name_for_record(record)
         else:
             record["顯示名稱"] = data["display"]
-            record["本次籌資計畫"] = data["purpose"]
+            if not wants_fresh_purpose:
+                record["本次籌資計畫"] = data["purpose"]
         if focus_keys is not None and record_key(record) not in focus_keys:
             continue
-        if record.get("分類") in ("CB", "ECB", "EB"):
-            mops_name = mops_bond_short_name(record, end)
-            if mops_name:
-                record["顯示名稱"] = mops_name
-            elif key not in BOND_SHORT_NAMES:
-                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到債券商品簡稱，已先用公司簡稱。")
-        if purpose_keys is not None and record_key(record) not in purpose_keys:
+        need_name = record.get("分類") in ("CB", "ECB", "EB") and key not in BOND_SHORT_NAMES
+        need_purpose = wants_fresh_purpose and not record.get("本次籌資計畫", "").strip()
+        if not ENABLE_ONLINE_MOPS_LOOKUP:
+            if need_name and not data:
+                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未啟用線上 MOPS 補查，已先用公司簡稱。")
+            if need_purpose:
+                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未啟用線上 MOPS 補查，請人工確認本次籌資計畫。")
             continue
-        if not record.get("本次籌資計畫", "").strip():
-            purpose = mops_funding_purpose(record, end)
-            if purpose:
-                record["本次籌資計畫"] = purpose
-            else:
-                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查不到本次籌資計畫，請人工確認。")
+        if need_name or need_purpose:
+            lookup_jobs.append((record, key, need_name, need_purpose))
+    if ENABLE_ONLINE_MOPS_LOOKUP and lookup_jobs:
+        workers = max(1, min(MAX_MOPS_WORKERS, len(lookup_jobs)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(online_mops_lookup, record.copy(), end, need_name, need_purpose): (record, key, need_name, need_purpose)
+                for record, key, need_name, need_purpose in lookup_jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                record, key, need_name, need_purpose = futures[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查詢失敗，請人工確認。{exc}")
+                    continue
+                if need_name:
+                    if result.get("name"):
+                        record["顯示名稱"] = result["name"]
+                    else:
+                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到債券商品簡稱，已先用公司簡稱。")
+                if need_purpose:
+                    if result.get("purpose"):
+                        record["本次籌資計畫"] = result["purpose"]
+                    else:
+                        warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 找不到可精準比對的本次籌資計畫，已留白避免查錯，請人工確認。")
     return warnings
 
 
@@ -1199,6 +1273,15 @@ def sheet_path_map(zf: zipfile.ZipFile) -> dict[str, str]:
     return paths
 
 
+def find_sheet_path(paths: dict[str, str], preferred_name: str, fallback_keywords: tuple[str, ...], default_path: str) -> str:
+    if preferred_name in paths:
+        return paths[preferred_name]
+    for name, path in paths.items():
+        if all(keyword in name for keyword in fallback_keywords):
+            return path
+    return default_path
+
+
 def worksheet_rows(root: ET.Element) -> list[ET.Element]:
     return root.findall(f".//{{{NS_MAIN}}}sheetData/{{{NS_MAIN}}}row")
 
@@ -1322,6 +1405,7 @@ def update_template_workbook(
     start: dt.date,
     end: dt.date,
     source_url: str,
+    template_path: Path | None,
     base_records: list[dict[str, str]],
     new_records: list[dict[str, str]],
     amend_records: list[dict[str, str]],
@@ -1329,7 +1413,7 @@ def update_template_workbook(
     effective_records: list[dict[str, str]],
     counts: dict[str, int],
 ) -> Path:
-    template = TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path
+    template = template_path if template_path and template_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path)
     filename = f"同業送件明細(截至{compact_roc_date(end)}).xlsx"
     target = available_report_path(REPORT_DIR / filename)
     with zipfile.ZipFile(template, "r") as zin:
@@ -1338,8 +1422,8 @@ def update_template_workbook(
         shared_xml = clear_previous_blue_runs(shared_xml)
         shared = xlsx_shared_strings(zin)
         paths = sheet_path_map(zin)
-        detail_path = paths.get(f"{roc_year(end)}年本次籌資計畫") or paths.get("115年本次籌資計畫") or "xl/worksheets/sheet2.xml"
-        summary_path = paths.get(f"{roc_year(end)}年") or paths.get("115年") or "xl/worksheets/sheet1.xml"
+        detail_path = find_sheet_path(paths, f"{roc_year(end)}年本次籌資計畫", ("本次籌資計畫",), "xl/worksheets/sheet2.xml")
+        summary_path = find_sheet_path(paths, f"{roc_year(end)}年", ("年",), "xl/worksheets/sheet1.xml")
         detail_xml = clear_blue_cell_styles(zin.read(detail_path).decode("utf-8"))
         summary_xml = clear_blue_cell_styles(zin.read(summary_path).decode("utf-8"))
 
@@ -1374,6 +1458,14 @@ def update_template_workbook(
                     date_changed = field in ("自動補正日期", "停止生效日期", "解除生效日期", "生效日期", "廢止/撤銷日期", "自行撤回日期", "退件日期") and old_value != new_value and new_value
                     if close_type_changed or date_changed:
                         row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, blue_detail_style_for_col(col))
+                if record_key(record) in {record_key(r) for r in new_records}:
+                    purpose_values = split_purpose(record)
+                    for index, col in enumerate(PURPOSE_COLS):
+                        old_value = existing.get(col, "")
+                        new_value = purpose_values[index] if index < len(purpose_values) else ""
+                        if old_value != new_value:
+                            style = blue_detail_style_for_col(col) if new_value else cell_style_from_row(row_xml, col, row_num)
+                            row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, style)
                 detail_xml = replace_exact_row_xml(detail_xml, original_row_xml, row_xml)
                 continue
             if not is_weekly:
@@ -1525,7 +1617,7 @@ def group_for_email(records: list[dict[str, str]]) -> list[str]:
     return lines
 
 
-def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "") -> dict[str, object]:
+def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "", base_path: Path | None = None) -> dict[str, object]:
     records = extract_records(source_path)
     new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
     amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
@@ -1582,12 +1674,14 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
         "lookupWarnings": len(lookup_warnings),
     }
 
-    if TEMPLATE_PATH.exists():
+    template_path = base_path if base_path and base_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else None)
+    if template_path is not None:
         target = update_template_workbook(
             source_path,
             start,
             end,
             source_url,
+            template_path,
             records,
             new_records,
             amend_records,
@@ -1629,6 +1723,7 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
         "end": end.isoformat(),
         "rocRange": f"{roc_date(start)}～{roc_date(end)}",
         "source": source_path.name,
+        "base": base_path.name if base_path else "",
         "sourceUrl": source_url,
         "counts": counts,
         "lookupWarnings": lookup_warnings,
@@ -1696,11 +1791,12 @@ HTML = """<!doctype html>
     <p>從證期局公開資料產出每週 Excel，免登入、免付費。</p>
   </div></header>
   <main><div class="wrap">
+    <form id="uploadForm" method="post" action="/api/generate-upload" enctype="multipart/form-data"></form>
     <section>
       <h2>設定截止日期</h2>
       <div class="controls">
         <label>截止週四
-          <input id="endDate" type="date">
+          <input id="endDate" name="end" form="uploadForm" type="date">
         </label>
       </div>
       <p id="status" class="status"></p>
@@ -1708,12 +1804,15 @@ HTML = """<!doctype html>
     </section>
     <section>
       <h2>手動上傳來源檔</h2>
-      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。系統會依 1150507 同業送件明細格式產出截至當日的 Excel 與 Email。</p>
+      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。若已有上週產出的同業送件明細，請一起上傳當基準檔；系統會保留舊資料，只有截止日前 7 天（含截止日）的新增或變動資料標藍。</p>
       <div class="controls">
-        <label>證期局年度申報案件 Excel
-          <input id="sourceFile" type="file" accept=".xlsx,.xls">
+        <label>上週同業送件明細（選填）
+          <input id="baseFile" name="base" form="uploadForm" type="file" accept=".xlsx,.xls">
         </label>
-        <button id="uploadBtn">用上傳檔產出</button>
+        <label>證期局年度申報案件 Excel
+          <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls">
+        </label>
+        <button id="uploadBtn" form="uploadForm" type="submit">用上傳檔產出</button>
       </div>
     </section>
     <section>
@@ -1726,13 +1825,14 @@ HTML = """<!doctype html>
     </section>
   </div></main>
   <script>
-    const endDate = document.querySelector("#endDate");
-    const statusEl = document.querySelector("#status");
-    const uploadBtn = document.querySelector("#uploadBtn");
-    const sourceFile = document.querySelector("#sourceFile");
-    const list = document.querySelector("#reportList");
-    const metrics = document.querySelector("#metrics");
-    const emailBox = document.querySelector("#emailBox");
+    let endDate;
+    let statusEl;
+    let uploadBtn;
+    let baseFile;
+    let sourceFile;
+    let list;
+    let metrics;
+    let emailBox;
 
     function latestThursday() {
       const d = new Date();
@@ -1741,13 +1841,23 @@ HTML = """<!doctype html>
       d.setDate(d.getDate() - diff);
       return d.toISOString().slice(0, 10);
     }
-    endDate.value = latestThursday();
-
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
       statusEl.className = "status" + (isError ? " error" : "");
     }
 
+    function reportRangeText() {
+      const end = new Date(`${endDate.value}T00:00:00`);
+      if (Number.isNaN(end.getTime())) return "";
+      const start = new Date(end);
+      start.setDate(start.getDate() - 6);
+      const fmt = d => d.toISOString().slice(0, 10);
+      return `處理區間：${fmt(start)} ～ ${fmt(end)}（含截止日，共 7 天）`;
+    }
+
+    function updateRangePreview() {
+      setStatus(reportRangeText());
+    }
     function renderMetrics(counts) {
       metrics.hidden = false;
       metrics.innerHTML = [
@@ -1783,21 +1893,30 @@ HTML = """<!doctype html>
       }
     }
 
-    uploadBtn.addEventListener("click", async () => {
+    async function handleUpload(event) {
+      if (event) event.preventDefault();
       const file = sourceFile.files[0];
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
         return;
       }
-      uploadBtn.disabled = true;
-      metrics.hidden = true;
-      setStatus("正在用上傳檔產出 Excel...");
-      try {
-        const form = new FormData();
-        form.append("source", file);
-        const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "產出失敗");
+        uploadBtn.disabled = true;
+        metrics.hidden = true;
+        emailBox.value = "";
+        setStatus("正在用上傳檔產出 Excel...");
+        try {
+          const form = new FormData();
+          if (baseFile.files[0]) form.append("base", baseFile.files[0]);
+          form.append("source", file);
+          const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
+          const responseText = await res.text();
+          let data = {};
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch (parseErr) {
+            throw new Error(responseText.slice(0, 300) || "伺服器回傳格式錯誤，請看 Render Logs。");
+          }
+          if (!res.ok) throw new Error(data.error || "產出失敗");
         renderMetrics(data.counts);
         emailBox.value = data.email || "";
         const warnings = (data.lookupWarnings || []).length
@@ -1810,10 +1929,31 @@ HTML = """<!doctype html>
       } finally {
         uploadBtn.disabled = false;
       }
-    });
+    }
 
-    loadReports().catch(err => {
-      list.textContent = err.message;
+    document.addEventListener("DOMContentLoaded", () => {
+      endDate = document.querySelector("#endDate");
+      statusEl = document.querySelector("#status");
+      uploadBtn = document.querySelector("#uploadBtn");
+      baseFile = document.querySelector("#baseFile");
+      sourceFile = document.querySelector("#sourceFile");
+      list = document.querySelector("#reportList");
+      metrics = document.querySelector("#metrics");
+      emailBox = document.querySelector("#emailBox");
+
+      if (!endDate || !statusEl || !uploadBtn || !baseFile || !sourceFile || !list || !metrics || !emailBox) {
+        document.body.insertAdjacentHTML("afterbegin", "<p style='padding:12px;color:#b00020'>頁面元件載入不完整，請重新整理。</p>");
+        return;
+      }
+
+      endDate.value = latestThursday();
+      updateRangePreview();
+      endDate.addEventListener("change", updateRangePreview);
+      uploadBtn.addEventListener("click", handleUpload);
+
+      loadReports().catch(err => {
+        list.textContent = err.message;
+      });
     });
   </script>
 </body>
@@ -1832,6 +1972,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_HEAD(self) -> None:
+        self.send_response(200)
+        self.end_headers()
 
     def do_GET(self) -> None:
         ensure_dirs()
@@ -1884,7 +2028,7 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(parsed.query)
             end_text = query.get("end", [""])[0]
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
-            start = end - dt.timedelta(days=6)
+            start, end = report_window(end)
             source_path, source_url = download_latest_source(end)
             result = build_report(source_path, start, end, source_url)
             self.send_json(200, result)
@@ -1892,18 +2036,65 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(exc)})
 
     def handle_upload_generate(self, parsed: urllib.parse.ParseResult) -> None:
+        accept = self.headers.get("Accept", "")
+        wants_html = "text/html" in accept and "application/json" not in accept
         try:
             query = urllib.parse.parse_qs(parsed.query)
-            end_text = query.get("end", [""])[0]
+            source_path, base_path, fields = self.save_uploaded_xlsx()
+            end_text = query.get("end", [""])[0] or fields.get("end", "")
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
-            start = end - dt.timedelta(days=6)
-            source_path = self.save_uploaded_xlsx()
-            result = build_report(source_path, start, end, "uploaded")
-            self.send_json(200, result)
+            start, end = report_window(end)
+            result = build_report(source_path, start, end, "uploaded", base_path=base_path)
+            if wants_html:
+                self.send_result_html(200, result)
+            else:
+                self.send_json(200, result)
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            if wants_html:
+                self.send_result_html(500, {"error": str(exc)})
+            else:
+                self.send_json(500, {"error": str(exc)})
 
-    def save_uploaded_xlsx(self) -> Path:
+    def send_result_html(self, status: int, payload: dict[str, object]) -> None:
+        if "error" in payload:
+            title = "產出失敗"
+            body_html = f"<p class='error'>{html.escape(str(payload.get('error', '產出失敗')))}</p><p><a href='/'>回首頁</a></p>"
+        else:
+            file_name = str(payload.get("file", ""))
+            email_text = str(payload.get("email", ""))
+            range_text = str(payload.get("rocRange", ""))
+            body_html = (
+                f"<p>已產出：{html.escape(file_name)}</p>"
+                f"<p>週期：{html.escape(range_text)}</p>"
+                f"<p><a class='download' href='/download/{urllib.parse.quote(file_name)}'>下載 Excel</a></p>"
+                f"<h2>Email 範本</h2><textarea readonly>{html.escape(email_text)}</textarea>"
+                "<p><a href='/'>回首頁</a></p>"
+            )
+            title = "產出完成"
+        page = f"""<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    body {{ margin:0; font-family:"Segoe UI","Microsoft JhengHei",sans-serif; color:#172033; background:#f7f8fa; }}
+    main {{ max-width: 920px; margin: 40px auto; padding: 24px; background:#fff; border:1px solid #d9dee8; border-radius:8px; }}
+    .download {{ display:inline-flex; padding:10px 14px; border-radius:6px; background:#12634f; color:#fff; text-decoration:none; font-weight:700; }}
+    textarea {{ width:100%; min-height:260px; border:1px solid #d9dee8; border-radius:8px; padding:12px; font:14px/1.6 Consolas,"Microsoft JhengHei",monospace; }}
+    .error {{ color:#b00020; white-space:pre-wrap; }}
+  </style>
+</head>
+<body><main><h1>{title}</h1>{body_html}</main></body>
+</html>"""
+        body = page.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def save_uploaded_xlsx(self) -> tuple[Path, Path | None, dict[str, str]]:
         content_type = self.headers.get("Content-Type", "")
         match = re.search(r"boundary=(.+)", content_type)
         if not match:
@@ -1912,24 +2103,39 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         parts = body.split(b"--" + boundary)
+        fields: dict[str, str] = {}
+        source_path: Path | None = None
+        base_path: Path | None = None
         for part in parts:
-            if b"Content-Disposition:" not in part or b"filename=" not in part:
+            if b"Content-Disposition:" not in part:
                 continue
             header, _, data = part.partition(b"\r\n\r\n")
             if not data:
+                continue
+            name_match = re.search(rb'name="([^"]*)"', header)
+            field_name = name_match.group(1).decode("utf-8", errors="ignore") if name_match else ""
+            data = data.rstrip(b"\r\n")
+            if data.endswith(b"--"):
+                data = data[:-2].rstrip(b"\r\n")
+            if b"filename=" not in header:
+                if field_name:
+                    fields[field_name] = data.decode("utf-8", errors="ignore").strip()
                 continue
             filename_match = re.search(rb'filename="([^"]*)"', header)
             filename = filename_match.group(1).decode("utf-8", errors="ignore") if filename_match else "source.xlsx"
             filename = Path(filename).name or "source.xlsx"
             if not filename.lower().endswith((".xlsx", ".xls")):
                 raise ValueError("請上傳 Excel 檔。")
-            data = data.rstrip(b"\r\n")
-            if data.endswith(b"--"):
-                data = data[:-2].rstrip(b"\r\n")
-            target = SOURCE_DIR / f"upload_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+            prefix = "base" if field_name == "base" else "source"
+            target = SOURCE_DIR / f"{prefix}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
             target.write_bytes(data)
-            return target
-        raise ValueError("沒有收到 Excel 檔。")
+            if field_name == "base":
+                base_path = target
+            else:
+                source_path = target
+        if source_path is not None:
+            return source_path, base_path, fields
+        raise ValueError("沒有收到證期局來源 Excel 檔。")
 
 
 def main() -> None:
