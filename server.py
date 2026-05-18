@@ -1241,6 +1241,15 @@ def sheet_path_map(zf: zipfile.ZipFile) -> dict[str, str]:
     return paths
 
 
+def find_sheet_path(paths: dict[str, str], preferred_name: str, fallback_keywords: tuple[str, ...], default_path: str) -> str:
+    if preferred_name in paths:
+        return paths[preferred_name]
+    for name, path in paths.items():
+        if all(keyword in name for keyword in fallback_keywords):
+            return path
+    return default_path
+
+
 def worksheet_rows(root: ET.Element) -> list[ET.Element]:
     return root.findall(f".//{{{NS_MAIN}}}sheetData/{{{NS_MAIN}}}row")
 
@@ -1380,8 +1389,8 @@ def update_template_workbook(
         shared_xml = clear_previous_blue_runs(shared_xml)
         shared = xlsx_shared_strings(zin)
         paths = sheet_path_map(zin)
-        detail_path = paths.get(f"{roc_year(end)}年本次籌資計畫") or paths.get("115年本次籌資計畫") or "xl/worksheets/sheet2.xml"
-        summary_path = paths.get(f"{roc_year(end)}年") or paths.get("115年") or "xl/worksheets/sheet1.xml"
+        detail_path = find_sheet_path(paths, f"{roc_year(end)}年本次籌資計畫", ("本次籌資計畫",), "xl/worksheets/sheet2.xml")
+        summary_path = find_sheet_path(paths, f"{roc_year(end)}年", ("年",), "xl/worksheets/sheet1.xml")
         detail_xml = clear_blue_cell_styles(zin.read(detail_path).decode("utf-8"))
         summary_xml = clear_blue_cell_styles(zin.read(summary_path).decode("utf-8"))
 
@@ -1783,23 +1792,26 @@ HTML = """<!doctype html>
       d.setDate(d.getDate() - diff);
       return d.toISOString().slice(0, 10);
     }
-
-    function setStatus(text, isError = false) {
-      statusEl.textContent = text;
-      statusEl.className = "status" + (isError ? " error" : "");
-    }
+    endDate.value = latestThursday();
 
     function reportRangeText() {
-      const end = new Date(endDate.value + "T00:00:00");
+      const end = new Date(`${endDate.value}T00:00:00`);
       if (Number.isNaN(end.getTime())) return "";
       const start = new Date(end);
       start.setDate(start.getDate() - 6);
       const fmt = d => d.toISOString().slice(0, 10);
-      return "處理區間：" + fmt(start) + " ～ " + fmt(end) + "（含截止日，共 7 天）";
+      return `處理區間：${fmt(start)} ～ ${fmt(end)}（含截止日，共 7 天）`;
     }
 
     function updateRangePreview() {
       setStatus(reportRangeText());
+    }
+    updateRangePreview();
+    endDate.addEventListener("change", updateRangePreview);
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (isError ? " error" : "");
     }
 
     function renderMetrics(counts) {
@@ -1808,10 +1820,10 @@ HTML = """<!doctype html>
         ["篩選後", counts.all],
         ["本週新增", counts.new],
         ["本週生效", counts.effective],
-        ["補正 / 停止", counts.amend + " / " + counts.stop],
+        ["補正 / 停止", `${counts.amend} / ${counts.stop}`],
         ["待補原因", counts.missingPurpose || 0],
         ["MOPS待確認", counts.lookupWarnings || 0],
-      ].map(([label, value]) => '<div class="metric"><span>' + label + '</span><strong>' + value + '</strong></div>').join("");
+      ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
     }
 
     async function loadReports() {
@@ -1826,9 +1838,9 @@ HTML = """<!doctype html>
           return;
         }
         list.className = "";
-        list.innerHTML = '<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>' +
-          data.reports.map(r => '<tr><td>' + r.file + '</td><td>' + r.modified + '</td><td><a class="download" href="/download/' + encodeURIComponent(r.file) + '">下載 Excel</a></td></tr>').join("") +
-          '</tbody></table>';
+        list.innerHTML = `<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>${
+          data.reports.map(r => `<tr><td>${r.file}</td><td>${r.modified}</td><td><a class="download" href="/download/${encodeURIComponent(r.file)}">下載 Excel</a></td></tr>`).join("")
+        }</tbody></table>`;
       } catch (err) {
         list.className = "empty";
         list.textContent = "檔案清單讀取失敗，請重新整理頁面。";
@@ -1849,15 +1861,15 @@ HTML = """<!doctype html>
       try {
         const form = new FormData();
         form.append("source", file);
-        const res = await fetch("/api/generate-upload?end=" + encodeURIComponent(endDate.value), { method: "POST", body: form });
+        const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || "產出失敗");
         renderMetrics(data.counts);
         emailBox.value = data.email || "";
         const warnings = (data.lookupWarnings || []).length
-          ? "\n\nMOPS 待確認：\n" + data.lookupWarnings.join("\n")
+          ? `\n\nMOPS 待確認：\n${data.lookupWarnings.join("\n")}`
           : "";
-        setStatus("已產出：" + data.file + "\n週期：" + data.rocRange + warnings);
+        setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
         await loadReports();
       } catch (err) {
         setStatus(err.message, true);
@@ -1866,15 +1878,10 @@ HTML = """<!doctype html>
       }
     });
 
-    endDate.value = latestThursday();
-    updateRangePreview();
-    endDate.addEventListener("change", updateRangePreview);
-
     loadReports().catch(err => {
       list.textContent = err.message;
     });
   </script>
-
 </body>
 </html>
 """
