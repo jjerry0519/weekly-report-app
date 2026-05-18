@@ -1764,7 +1764,7 @@ HTML = """<!doctype html>
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" type="file" accept=".xlsx,.xls">
         </label>
-        <button id="uploadBtn">用上傳檔產出</button>
+        <button id="uploadBtn" type="button">用上傳檔產出</button>
       </div>
     </section>
     <section>
@@ -1777,13 +1777,13 @@ HTML = """<!doctype html>
     </section>
   </div></main>
   <script>
-    const endDate = document.querySelector("#endDate");
-    const statusEl = document.querySelector("#status");
-    const uploadBtn = document.querySelector("#uploadBtn");
-    const sourceFile = document.querySelector("#sourceFile");
-    const list = document.querySelector("#reportList");
-    const metrics = document.querySelector("#metrics");
-    const emailBox = document.querySelector("#emailBox");
+    let endDate;
+    let statusEl;
+    let uploadBtn;
+    let sourceFile;
+    let list;
+    let metrics;
+    let emailBox;
 
     function latestThursday() {
       const d = new Date();
@@ -1792,7 +1792,10 @@ HTML = """<!doctype html>
       d.setDate(d.getDate() - diff);
       return d.toISOString().slice(0, 10);
     }
-    endDate.value = latestThursday();
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.className = "status" + (isError ? " error" : "");
+    }
 
     function reportRangeText() {
       const end = new Date(`${endDate.value}T00:00:00`);
@@ -1806,14 +1809,6 @@ HTML = """<!doctype html>
     function updateRangePreview() {
       setStatus(reportRangeText());
     }
-    updateRangePreview();
-    endDate.addEventListener("change", updateRangePreview);
-
-    function setStatus(text, isError = false) {
-      statusEl.textContent = text;
-      statusEl.className = "status" + (isError ? " error" : "");
-    }
-
     function renderMetrics(counts) {
       metrics.hidden = false;
       metrics.innerHTML = [
@@ -1849,21 +1844,28 @@ HTML = """<!doctype html>
       }
     }
 
-    uploadBtn.addEventListener("click", async () => {
+    async function handleUpload() {
       const file = sourceFile.files[0];
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
         return;
       }
-      uploadBtn.disabled = true;
-      metrics.hidden = true;
-      setStatus("正在用上傳檔產出 Excel...");
-      try {
-        const form = new FormData();
-        form.append("source", file);
-        const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || "產出失敗");
+        uploadBtn.disabled = true;
+        metrics.hidden = true;
+        emailBox.value = "";
+        setStatus("正在用上傳檔產出 Excel...");
+        try {
+          const form = new FormData();
+          form.append("source", file);
+          const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
+          const responseText = await res.text();
+          let data = {};
+          try {
+            data = responseText ? JSON.parse(responseText) : {};
+          } catch (parseErr) {
+            throw new Error(responseText.slice(0, 300) || "伺服器回傳格式錯誤，請看 Render Logs。");
+          }
+          if (!res.ok) throw new Error(data.error || "產出失敗");
         renderMetrics(data.counts);
         emailBox.value = data.email || "";
         const warnings = (data.lookupWarnings || []).length
@@ -1876,10 +1878,30 @@ HTML = """<!doctype html>
       } finally {
         uploadBtn.disabled = false;
       }
-    });
+    }
 
-    loadReports().catch(err => {
-      list.textContent = err.message;
+    document.addEventListener("DOMContentLoaded", () => {
+      endDate = document.querySelector("#endDate");
+      statusEl = document.querySelector("#status");
+      uploadBtn = document.querySelector("#uploadBtn");
+      sourceFile = document.querySelector("#sourceFile");
+      list = document.querySelector("#reportList");
+      metrics = document.querySelector("#metrics");
+      emailBox = document.querySelector("#emailBox");
+
+      if (!endDate || !statusEl || !uploadBtn || !sourceFile || !list || !metrics || !emailBox) {
+        document.body.insertAdjacentHTML("afterbegin", "<p style='padding:12px;color:#b00020'>頁面元件載入不完整，請重新整理。</p>");
+        return;
+      }
+
+      endDate.value = latestThursday();
+      updateRangePreview();
+      endDate.addEventListener("change", updateRangePreview);
+      uploadBtn.addEventListener("click", handleUpload);
+
+      loadReports().catch(err => {
+        list.textContent = err.message;
+      });
     });
   </script>
 </body>
