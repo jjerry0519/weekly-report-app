@@ -463,7 +463,7 @@ def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     dates: list[dt.date] = []
-    for date_value in (received, end):
+    for date_value in (received, end, received + dt.timedelta(days=31), received - dt.timedelta(days=31)):
         if date_value not in dates:
             dates.append(date_value)
     texts: list[str] = []
@@ -479,6 +479,9 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
         }
         texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
         texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params))
+        keyword_params = dict(params)
+        keyword_params["keyWord"] = "轉換公司債" if record.get("分類") in ("CB", "ECB", "EB") else "現金增資"
+        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params))
         if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
             bond_params = dict(params)
             bond_params["TYPEK"] = ""
@@ -912,6 +915,40 @@ def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[
             record["顯示名稱"] = stock_display_name(record)
 
 
+def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
+    missing: list[str] = []
+    for record in records:
+        if record.get("分類") not in ("CB", "ECB", "EB"):
+            continue
+        if focus_keys is not None and record_key(record) not in focus_keys:
+            continue
+        if is_bond_product_name(record.get("顯示名稱", "")):
+            continue
+        missing.append(
+            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
+            f"{record.get('案件類別', '')} {record.get('金額', '')} "
+            f"收文{record.get('收文日期', '')}"
+        )
+    if missing:
+        raise ValueError("MOPS 第幾次發行查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
+
+
+def require_purposes(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
+    missing: list[str] = []
+    for record in records:
+        if focus_keys is not None and record_key(record) not in focus_keys:
+            continue
+        if record.get("本次籌資計畫", "").strip():
+            continue
+        missing.append(
+            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
+            f"{record.get('案件類別', '')} {record.get('金額', '')} "
+            f"收文{record.get('收文日期', '')}"
+        )
+    if missing:
+        raise ValueError("MOPS 本次籌資計畫原因查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
+
+
 def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
     cleaned: list[str] = []
     for ordinal in ordinals:
@@ -932,13 +969,6 @@ def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
         else:
             start += 1
     return cleaned[:count]
-
-
-def missing_bond_display_name(record: dict[str, str]) -> str:
-    base = normalize_stock_short_for_bond(record.get("顯示名稱") or display_name_for_record(record) or record.get("公司名稱", ""))
-    if base.startswith("MOPS待確認："):
-        base = base.removeprefix("MOPS待確認：")
-    return f"MOPS待確認：{base or record.get('公司名稱', '')}"
 
 
 def clean_explicit_bond_short(value: str) -> str:
@@ -1121,8 +1151,7 @@ def enrich_records(
                     if result.get("bond_name"):
                         record["顯示名稱"] = result["bond_name"]
                     else:
-                        record["顯示名稱"] = missing_bond_display_name(record)
-                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱，已先用公司簡稱並列入待確認。")
+                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱。")
                 if need_purpose:
                     if result.get("purpose"):
                         record["本次籌資計畫"] = result["purpose"]
@@ -1130,6 +1159,8 @@ def enrich_records(
                         warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 找不到可精準比對的本次籌資計畫，已留白避免查錯，請人工確認。")
         resolve_missing_bond_names(records, end, focus_keys, warnings)
         normalize_weekly_stock_names(records, focus_keys)
+        require_bond_names(records, focus_keys)
+        require_purposes(records, purpose_keys)
     return warnings
 
 
@@ -2459,8 +2490,6 @@ def update_template_workbook_openpyxl(
             blue_cols = compare_blue_columns(existing_record, record)
             if is_bond_product_name(existing_record.get("公司名稱", "")) and not is_bond_product_name(record.get("顯示名稱", "")):
                 record["顯示名稱"] = existing_record["公司名稱"]
-            if record.get("分類") in ("CB", "ECB", "EB") and weekly_blue_columns(record, start, end) and not is_bond_product_name(record.get("顯示名稱", "")):
-                record["顯示名稱"] = missing_bond_display_name(record)
             if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
                 record["本次籌資計畫"] = existing_record["本次籌資計畫"]
             if blue_cols:
@@ -2993,7 +3022,7 @@ HTML = """<!doctype html>
         ["本週生效", counts.effective],
         ["補正 / 停止", `${counts.amend} / ${counts.stop}`],
         ["待補原因", counts.missingPurpose || 0],
-        ["MOPS待確認", counts.lookupWarnings || 0],
+        ["查詢未完成", counts.lookupWarnings || 0],
       ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
     }
 
