@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import datetime as dt
 import concurrent.futures
+import csv
 import html
+import io
 import json
 import os
 import posixpath
@@ -312,12 +314,17 @@ def html_to_text(value: str) -> str:
 
 
 def public_company_short_name(security_code: str) -> str:
-    urls = (
+    json_urls = (
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
-        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O",
+        "https://www.tpex.org.tw/openapi/v1/t187ap03_O",
     )
-    for url in urls:
+    csv_urls = (
+        "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap03_P.csv",
+    )
+    for url in json_urls:
         try:
             rows = json.loads(public_fetch_text(url, timeout=3))
         except Exception:
@@ -333,6 +340,22 @@ def public_company_short_name(security_code: str) -> str:
             name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("Name") or "").strip()
             if name:
                 return name
+    for url in csv_urls:
+        try:
+            text = public_fetch_text(url, timeout=3)
+        except Exception:
+            continue
+        try:
+            reader = csv.DictReader(io.StringIO(text))
+            for row in reader:
+                code = str(row.get("公司代號") or row.get("有價證券代號") or row.get("證券代號") or "").strip()
+                if code != security_code:
+                    continue
+                name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("公司名稱") or "").strip()
+                if name:
+                    return name
+        except Exception:
+            continue
     return ""
 
 
@@ -352,13 +375,20 @@ def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
     return "\n".join(texts)
 
 
-def parse_bond_short_from_text(text: str, record: dict[str, str]) -> str:
+def parse_bond_short_from_text(text: str, record: dict[str, str], company_short: str = "") -> str:
     if not text:
         return ""
     compact = html_to_text(text)
     security_code = record.get("證券代號", "")
-    base = SECURITY_SHORT_NAMES.get(security_code) or public_company_short_name(security_code) or record.get("公司名稱", "")
-    bases = {base, base.replace("-KY", ""), record.get("公司名稱", "").replace("F-", "").replace("-KY", "")}
+    online_or_source = company_short or record.get("顯示名稱", "") or record.get("公司名稱", "")
+    fallback = SECURITY_SHORT_NAMES.get(security_code, "")
+    bases = {
+        online_or_source,
+        online_or_source.replace("-KY", ""),
+        record.get("公司名稱", "").replace("F-", "").replace("-KY", ""),
+        fallback,
+        fallback.replace("-KY", ""),
+    }
     suffix = r"(?:海外)?[一二三四五六七八九十百\d]+(?:-KY)?"
     candidates: list[str] = []
     for item in bases:
@@ -377,9 +407,10 @@ def parse_bond_short_from_text(text: str, record: dict[str, str]) -> str:
     return candidates[0] if candidates else ""
 
 
-def mops_bond_short_name(record: dict[str, str], end: dt.date) -> str:
+def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: str = "") -> str:
     if record.get("分類") not in ("CB", "ECB", "EB"):
         return ""
+    received = parse_date(record.get("收文日期", "")) or end
     params = {
         "encodeURIComponent": "1",
         "step": "1",
@@ -387,11 +418,16 @@ def mops_bond_short_name(record: dict[str, str], end: dt.date) -> str:
         "TYPEK": "",
         "bond_kind": "5,7",
         "co_id": record.get("證券代號", ""),
-        "year": f"{roc_year(end):03d}",
-        "month": f"{end.month:02d}",
+        "year": f"{roc_year(received):03d}",
+        "month": f"{received.month:02d}",
     }
-    text = mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params)
-    return parse_bond_short_from_text(text, record)
+    texts = [mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params)]
+    if received.month != end.month or received.year != end.year:
+        params_end = dict(params)
+        params_end["year"] = f"{roc_year(end):03d}"
+        params_end["month"] = f"{end.month:02d}"
+        texts.append(mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params_end))
+    return parse_bond_short_from_text("\n".join(texts), record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -514,14 +550,17 @@ def display_name_for_record(record: dict[str, str]) -> str:
 
 def online_mops_lookup(record: dict[str, str], end: dt.date, need_company_short: bool, need_bond_name: bool, need_purpose: bool) -> dict[str, str]:
     result: dict[str, str] = {}
+    short_name = ""
     if need_company_short:
         short_name = public_company_short_name(record.get("證券代號", ""))
         if short_name:
             result["company_short"] = short_name
+            record["顯示名稱"] = short_name
     if need_bond_name:
-        name = mops_bond_short_name(record, end)
+        name = mops_bond_short_name(record, end, short_name)
         if name:
             result["bond_name"] = name
+            record["顯示名稱"] = name
     if need_purpose:
         purpose = mops_funding_purpose(record, end)
         if purpose:
@@ -1054,16 +1093,13 @@ DETAIL_COLS = {
 
 
 PURPOSE_COLS = ["T", "U", "V", "W", "X", "Y", "Z"]
-BLUE_DETAIL_STYLE = "35"
-BLUE_SUMMARY_STYLE = "61"
+BLUE_RGB = "FF0000FF"
+BLACK_RGB = "FF000000"
 
 
-def blue_detail_style_for_col(col: str) -> str:
-    if col == "C":
-        return "59"
-    if col == "D" or col in PURPOSE_COLS:
-        return "35"
-    return "62"
+def is_blue_rgb(value: str) -> bool:
+    color = value.strip().upper()
+    return color.endswith("0000FF") or color.endswith("0563C1")
 
 
 def escape_xml_text(value: object) -> str:
@@ -1079,17 +1115,25 @@ def inline_cell_xml(ref: str, value: object, style: str | None = None) -> str:
     return f'<c r="{ref}"{style_part} t="inlineStr"><is><t{space}>{escape_xml_text(text)}</t></is></c>'
 
 
+CELL_XML_RE = re.compile(r"<c\b[^>]*/>|<c\b[^>]*>[\s\S]*?</c>")
+
+
+def cell_ref_from_xml(cell_xml: str) -> str:
+    match = re.search(r'\br="([^"]+)"', cell_xml)
+    return match.group(1) if match else ""
+
+
 def upsert_cell_xml(row_xml: str, row_num: int, col: str, value: object, style: str | None = None) -> str:
     ref = f"{col}{row_num}"
     new_cell = inline_cell_xml(ref, value, style)
-    pattern = re.compile(rf'<c\b[^>]*\br="{re.escape(ref)}"[^>]*(?:>[\s\S]*?</c>|/>)')
-    if pattern.search(row_xml):
-        return pattern.sub(new_cell, row_xml, count=1)
+    for match in CELL_XML_RE.finditer(row_xml):
+        if cell_ref_from_xml(match.group(0)) == ref:
+            return row_xml[: match.start()] + new_cell + row_xml[match.end() :]
     row_close = "</row>"
-    cells = list(re.finditer(r'<c\b[^>]*\br="([A-Z]+)\d+"[^>]*(?:>[\s\S]*?</c>|/>)', row_xml))
     insert_at = row_xml.rfind(row_close)
-    for match in cells:
-        if col_to_number(match.group(1)) > col_to_number(col):
+    for match in CELL_XML_RE.finditer(row_xml):
+        current_col = cell_col(cell_ref_from_xml(match.group(0)))
+        if current_col and col_to_number(current_col) > col_to_number(col):
             insert_at = match.start()
             break
     return row_xml[:insert_at] + new_cell + row_xml[insert_at:]
@@ -1119,13 +1163,19 @@ def clone_row_xml(row_xml: str, old_num: int, new_num: int) -> str:
         lambda m: f'{m.group(1)}{m.group(2)}{new_num}{m.group(3)}',
         cloned,
     )
-    cloned = re.sub(
-        r'<c\b([^>]*)\br="([A-Z]+)' + str(new_num) + r'"([^>]*)(?:>[\s\S]*?</c>|/>)',
-        lambda m: f'<c{m.group(1)}r="{m.group(2)}{new_num}"{m.group(3)}/>',
-        cloned,
-    )
-    cloned = re.sub(r'\s+t="[^"]+"', '', cloned)
-    return cloned
+
+    def clear_cell(match: re.Match[str]) -> str:
+        cell_xml = match.group(0)
+        tag_end = cell_xml.find(">")
+        if tag_end < 0:
+            return cell_xml
+        opening = cell_xml[: tag_end + 1]
+        if opening.endswith("/>"):
+            opening = opening[:-2] + ">"
+        opening = re.sub(r'\s+t="[^"]+"', "", opening)
+        return opening[:-1].rstrip() + "/>"
+
+    return CELL_XML_RE.sub(clear_cell, cloned)
 
 
 def update_dimension_xml(sheet_xml: str, last_col: str, last_row: int) -> str:
@@ -1187,6 +1237,131 @@ def cell_style_from_row(row_xml: str, col: str, row_num: int) -> str | None:
     return None
 
 
+def xml_items(container_xml: str, tag: str) -> list[str]:
+    return re.findall(rf"<{tag}\b[^>]*(?:/>|>[\s\S]*?</{tag}>)", container_xml)
+
+
+def set_opening_attr(xml: str, tag: str, attr: str, value: str) -> str:
+    def replace(match: re.Match[str]) -> str:
+        head, attrs, slash = match.group(1), match.group(2), match.group(3)
+        if re.search(rf'\b{re.escape(attr)}="[^"]*"', attrs):
+            attrs = re.sub(rf'\b{re.escape(attr)}="[^"]*"', f'{attr}="{value}"', attrs, count=1)
+        else:
+            attrs = attrs.rstrip() + f' {attr}="{value}"'
+        return f"{head}{attrs}{slash}>"
+
+    return re.sub(rf"^(<{tag}\b)([^>]*?)(/?)>", replace, xml, count=1)
+
+
+def set_font_color(font_xml: str, rgb: str) -> str:
+    color = f'<color rgb="{rgb}"/>'
+    if re.search(r"<color\b[^>]*/>", font_xml):
+        return re.sub(r"<color\b[^>]*/>", color, font_xml, count=1)
+    if re.search(r"<color\b[^>]*></color>", font_xml):
+        return re.sub(r"<color\b[^>]*></color>", color, font_xml, count=1)
+    if re.search(r"<sz\b[^>]*/>", font_xml):
+        return re.sub(r"(<sz\b[^>]*/>)", rf"\1{color}", font_xml, count=1)
+    return font_xml.replace(">", ">" + color, 1)
+
+
+def font_is_blue(font_xml: str) -> bool:
+    for rgb in re.findall(r'<color\b[^>]*\brgb="([^"]+)"', font_xml, flags=re.I):
+        if is_blue_rgb(rgb):
+            return True
+    return bool(re.search(r'<color\b[^>]*\bindexed="4"', font_xml, flags=re.I))
+
+
+class XlsxStyleManager:
+    def __init__(self, styles_xml: str):
+        self.styles_xml = styles_xml
+        fonts_match = re.search(r"<fonts\b[^>]*>[\s\S]*?</fonts>", styles_xml)
+        cell_xfs_match = re.search(r"<cellXfs\b[^>]*>[\s\S]*?</cellXfs>", styles_xml)
+        self.fonts = xml_items(fonts_match.group(0), "font") if fonts_match else []
+        self.cell_xfs = xml_items(cell_xfs_match.group(0), "xf") if cell_xfs_match else []
+        self.font_cache: dict[tuple[int, str], int] = {}
+        self.style_cache: dict[tuple[int, int], int] = {}
+        self.black_style_cache: dict[str | None, str | None] = {}
+        self.blue_style_cache: dict[str | None, str | None] = {}
+
+    def _font_id_for_style(self, style: str | None) -> int:
+        try:
+            style_id = int(style or "0")
+            xf = self.cell_xfs[style_id]
+        except (ValueError, IndexError):
+            return 0
+        match = re.search(r'\bfontId="(\d+)"', xf)
+        return int(match.group(1)) if match else 0
+
+    def _style_with_font(self, style: str | None, font_id: int) -> str | None:
+        try:
+            style_id = int(style or "0")
+            base = self.cell_xfs[style_id]
+        except (ValueError, IndexError):
+            return style
+        key = (style_id, font_id)
+        if key in self.style_cache:
+            return str(self.style_cache[key])
+        new_xf = set_opening_attr(base, "xf", "fontId", str(font_id))
+        new_xf = set_opening_attr(new_xf, "xf", "applyFont", "1")
+        for index, xf in enumerate(self.cell_xfs):
+            if xf == new_xf:
+                self.style_cache[key] = index
+                return str(index)
+        self.cell_xfs.append(new_xf)
+        new_id = len(self.cell_xfs) - 1
+        self.style_cache[key] = new_id
+        return str(new_id)
+
+    def _font_with_color(self, font_id: int, rgb: str) -> int:
+        key = (font_id, rgb)
+        if key in self.font_cache:
+            return self.font_cache[key]
+        base = self.fonts[font_id] if 0 <= font_id < len(self.fonts) else (self.fonts[0] if self.fonts else "<font/>")
+        new_font = set_font_color(base, rgb)
+        for index, font in enumerate(self.fonts):
+            if font == new_font:
+                self.font_cache[key] = index
+                return index
+        self.fonts.append(new_font)
+        new_id = len(self.fonts) - 1
+        self.font_cache[key] = new_id
+        return new_id
+
+    def black_style(self, style: str | None) -> str | None:
+        if style in self.black_style_cache:
+            return self.black_style_cache[style]
+        font_id = self._font_id_for_style(style)
+        if 0 <= font_id < len(self.fonts) and font_is_blue(self.fonts[font_id]):
+            black_font = self._font_with_color(font_id, BLACK_RGB)
+            result = self._style_with_font(style, black_font)
+        else:
+            result = style
+        self.black_style_cache[style] = result
+        return result
+
+    def blue_style(self, style: str | None) -> str | None:
+        if style in self.blue_style_cache:
+            return self.blue_style_cache[style]
+        base_style = self.black_style(style)
+        base_font = self._font_id_for_style(base_style)
+        blue_font = self._font_with_color(base_font, BLUE_RGB)
+        result = self._style_with_font(base_style, blue_font)
+        self.blue_style_cache[style] = result
+        return result
+
+    def finalize(self) -> str:
+        def replace_section(xml: str, tag: str, items: list[str]) -> str:
+            def replace(match: re.Match[str]) -> str:
+                opening = re.sub(r'\bcount="\d+"', f'count="{len(items)}"', match.group(1), count=1)
+                return opening + "".join(items) + match.group(3)
+
+            return re.sub(rf"(<{tag}\b[^>]*>)([\s\S]*?)(</{tag}>)", replace, xml, count=1)
+
+        self.styles_xml = replace_section(self.styles_xml, "fonts", self.fonts)
+        self.styles_xml = replace_section(self.styles_xml, "cellXfs", self.cell_xfs)
+        return self.styles_xml
+
+
 def append_shared_string(shared_xml: str, text: str, blue_suffix: str = "") -> tuple[str, int]:
     sis = re.findall(r"<si>[\s\S]*?</si>", shared_xml)
     index = len(sis)
@@ -1221,7 +1396,9 @@ def clear_previous_blue_runs(shared_xml: str) -> str:
     # back to plain shared strings before adding this week's blue text.
     def replace_si(match: re.Match[str]) -> str:
         si = match.group(0)
-        if 'rgb="FF0000FF"' not in si:
+        colors = re.findall(r'<color\b[^>]*\brgb="([^"]+)"', si, flags=re.I)
+        indexed_blue = re.search(r'<color\b[^>]*\bindexed="4"', si, flags=re.I)
+        if not indexed_blue and not any(is_blue_rgb(color) for color in colors):
             return si
         text = "".join(html.unescape(t) for t in re.findall(r"<t[^>]*>([\s\S]*?)</t>", si))
         return f"<si><t>{escape_xml_text(text)}</t></si>"
@@ -1229,29 +1406,24 @@ def clear_previous_blue_runs(shared_xml: str) -> str:
     return re.sub(r"<si>[\s\S]*?</si>", replace_si, shared_xml)
 
 
-def clear_blue_cell_styles(sheet_xml: str, blue_styles: tuple[str, ...] = (BLUE_DETAIL_STYLE, BLUE_SUMMARY_STYLE, "59", "62")) -> str:
-    replacements = {
-        "35": "37",  # detail company/name-like cells
-        "59": "37",  # detail status cells
-        "61": "19",  # summary plain cells
-        "62": "36",  # detail date cells
-    }
-    for style, replacement in replacements.items():
-        sheet_xml = re.sub(rf'(<c\b[^>]*\bs="){style}(")', lambda m: f'{m.group(1)}{replacement}{m.group(2)}', sheet_xml)
-    return sheet_xml
+def clear_blue_cell_styles(sheet_xml: str, styles: XlsxStyleManager) -> str:
+    def replace(match: re.Match[str]) -> str:
+        return f'{match.group(1)}{styles.black_style(match.group(2))}{match.group(3)}'
+
+    return re.sub(r'(<c\b[^>]*\bs=")(\d+)(")', replace, sheet_xml)
 
 
 def upsert_shared_cell_xml(row_xml: str, row_num: int, col: str, shared_index: int, style: str | None = None) -> str:
     ref = f"{col}{row_num}"
     style_part = f' s="{style}"' if style is not None else ""
     new_cell = f'<c r="{ref}"{style_part} t="s"><v>{shared_index}</v></c>'
-    pattern = re.compile(rf'<c\b[^>]*\br="{re.escape(ref)}"[^>]*(?:>[\s\S]*?</c>|/>)')
-    if pattern.search(row_xml):
-        return pattern.sub(new_cell, row_xml, count=1)
-    cells = list(re.finditer(r'<c\b[^>]*\br="([A-Z]+)\d+"[^>]*(?:>[\s\S]*?</c>|/>)', row_xml))
+    for match in CELL_XML_RE.finditer(row_xml):
+        if cell_ref_from_xml(match.group(0)) == ref:
+            return row_xml[: match.start()] + new_cell + row_xml[match.end() :]
     insert_at = row_xml.rfind("</row>")
-    for match in cells:
-        if col_to_number(match.group(1)) > col_to_number(col):
+    for match in CELL_XML_RE.finditer(row_xml):
+        current_col = cell_col(cell_ref_from_xml(match.group(0)))
+        if current_col and col_to_number(current_col) > col_to_number(col):
             insert_at = match.start()
             break
     return row_xml[:insert_at] + new_cell + row_xml[insert_at:]
@@ -1471,11 +1643,12 @@ def update_template_workbook(
         shared_xml = zin.read("xl/sharedStrings.xml").decode("utf-8") if "xl/sharedStrings.xml" in names else '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>'
         shared_xml = clear_previous_blue_runs(shared_xml)
         shared = xlsx_shared_strings(zin)
+        styles = XlsxStyleManager(zin.read("xl/styles.xml").decode("utf-8")) if "xl/styles.xml" in names else XlsxStyleManager("")
         paths = sheet_path_map(zin)
         detail_path = find_sheet_path(paths, f"{roc_year(end)}年本次籌資計畫", ("本次籌資計畫",), "xl/worksheets/sheet2.xml")
         summary_path = find_sheet_path(paths, f"{roc_year(end)}年", ("年",), "xl/worksheets/sheet1.xml")
-        detail_xml = clear_blue_cell_styles(zin.read(detail_path).decode("utf-8"))
-        summary_xml = clear_blue_cell_styles(zin.read(summary_path).decode("utf-8"))
+        detail_xml = clear_blue_cell_styles(zin.read(detail_path).decode("utf-8"), styles)
+        summary_xml = clear_blue_cell_styles(zin.read(summary_path).decode("utf-8"), styles)
 
         detail_rows = [
             (int(match.group(1)), match.group(0))
@@ -1504,17 +1677,21 @@ def update_template_workbook(
                 for field, col in DETAIL_COLS.items():
                     old_value = existing.get(col, "")
                     new_value = record.get(field, "")
-                    close_type_changed = field == "結案類型" and old_value != new_value and new_value
-                    date_changed = field in ("自動補正日期", "停止生效日期", "解除生效日期", "生效日期", "廢止/撤銷日期", "自行撤回日期", "退件日期") and old_value != new_value and new_value
-                    if close_type_changed or date_changed:
-                        row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, blue_detail_style_for_col(col))
+                    close_type_changed = field == "結案類型" and old_value != new_value and new_value and is_weekly
+                    date_field_changed = field in ("自動補正日期", "停止生效日期", "解除生效日期", "生效日期", "廢止/撤銷日期", "自行撤回日期", "退件日期") and old_value != new_value and new_value
+                    date_is_weekly = date_field_changed and in_range(new_value, start, end)
+                    if close_type_changed or date_field_changed:
+                        base_style = cell_style_from_row(row_xml, col, row_num)
+                        style = styles.blue_style(base_style) if close_type_changed or date_is_weekly else base_style
+                        row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, style)
                 if record_key(record) in {record_key(r) for r in new_records}:
                     purpose_values = split_purpose(record)
                     for index, col in enumerate(PURPOSE_COLS):
                         old_value = existing.get(col, "")
                         new_value = purpose_values[index] if index < len(purpose_values) else ""
                         if old_value != new_value:
-                            style = blue_detail_style_for_col(col) if new_value else cell_style_from_row(row_xml, col, row_num)
+                            base_style = cell_style_from_row(row_xml, col, row_num)
+                            style = styles.blue_style(base_style) if new_value else base_style
                             row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, style)
                 detail_xml = replace_exact_row_xml(detail_xml, original_row_xml, row_xml)
                 continue
@@ -1524,10 +1701,12 @@ def update_template_workbook(
             new_row_xml = clone_row_xml(last_data_row_xml, last_data_row_num, last_row_num)
             for field, col in DETAIL_COLS.items():
                 value = record.get(field, "")
-                style = blue_detail_style_for_col(col) if str(value).strip() else cell_style_from_row(new_row_xml, col, last_row_num)
+                base_style = cell_style_from_row(new_row_xml, col, last_row_num)
+                style = styles.blue_style(base_style) if str(value).strip() else base_style
                 new_row_xml = upsert_cell_xml(new_row_xml, last_row_num, col, value, style)
             for col, value in zip(PURPOSE_COLS, split_purpose(record)):
-                style = blue_detail_style_for_col(col) if str(value).strip() else cell_style_from_row(new_row_xml, col, last_row_num)
+                base_style = cell_style_from_row(new_row_xml, col, last_row_num)
+                style = styles.blue_style(base_style) if str(value).strip() else base_style
                 new_row_xml = upsert_cell_xml(new_row_xml, last_row_num, col, value, style)
             detail_xml = append_row_xml(detail_xml, new_row_xml)
 
@@ -1620,6 +1799,8 @@ def update_template_workbook(
                     zout.writestr(name, detail_xml.encode("utf-8"))
                 elif name == summary_path:
                     zout.writestr(name, summary_xml.encode("utf-8"))
+                elif name == "xl/styles.xml":
+                    zout.writestr(name, styles.finalize().encode("utf-8"))
                 elif name == "xl/sharedStrings.xml":
                     zout.writestr(name, shared_xml.encode("utf-8"))
                 elif name == "[Content_Types].xml":
@@ -1668,6 +1849,8 @@ def group_for_email(records: list[dict[str, str]]) -> list[str]:
 
 
 def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "", base_path: Path | None = None) -> dict[str, object]:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     records = extract_records(source_path)
     new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
     amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
