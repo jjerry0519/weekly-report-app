@@ -390,6 +390,43 @@ def public_company_short_name(security_code: str) -> str:
                     return name
         except Exception:
             continue
+    mops_name = mops_company_short_name(security_code)
+    if mops_name:
+        return mops_name
+    return ""
+
+
+def mops_company_short_name(security_code: str) -> str:
+    if not security_code:
+        return ""
+    params = {
+        "encodeURIComponent": "1",
+        "step": "1",
+        "firstin": "1",
+        "off": "1",
+        "keyword4": "",
+        "code1": "",
+        "TYPEK2": "",
+        "checkbtn": "",
+        "queryName": "co_id",
+        "inpuType": "co_id",
+        "TYPEK": "all",
+        "co_id": security_code,
+    }
+    text = mops_query_text(("/mops/web/ajax_t05st03", "/mops/web/t05st03"), params)
+    compact = normalize_header(html_to_text(text))
+    if security_code not in compact:
+        return ""
+    patterns = (
+        rf"{re.escape(security_code)}(?:公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{{2,16}})",
+        r"(?:公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{2,16})",
+        rf"{re.escape(security_code)}([\u4e00-\u9fffA-Za-z0-9-]{{2,16}})(?:上市|上櫃|興櫃|公開發行)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, compact):
+            candidate = match.group(1).strip()
+            if is_plausible_security_short(candidate):
+                return candidate
     return ""
 
 
@@ -1209,14 +1246,9 @@ def extract_imp_summary_records(rows: list[dict[str, str]]) -> list[dict[str, st
             continue
 
         code = case_code(case_type)
-        if code == "CI":
-            currency = ""
-            issue_price = row.get("H", "").strip()
-            received_date = row.get("J", "").strip()
-        else:
-            currency = row.get("H", "").strip()
-            issue_price = ""
-            received_date = row.get("I", "").strip() or row.get("J", "").strip()
+        currency = row.get("H", "").strip()
+        issue_price = row.get("I", "").strip()
+        received_date = row.get("J", "").strip()
 
         amend_date = row.get("K", "").strip()
         stop_date = row.get("L", "").strip()
@@ -1921,11 +1953,11 @@ def set_cell_cached_value_xml(row_xml: str, row_num: int, col: str, value: objec
 
 
 def record_key(record: dict[str, str]) -> str:
+    amount_digits = re.sub(r"\D", "", str(record.get("金額", "") or ""))
     parts = [
         record.get("證券代號", ""),
-        record.get("公司名稱", ""),
-        record.get("案件類別", ""),
-        record.get("金額", ""),
+        record.get("分類", "") or case_code(record.get("案件類別", "")),
+        amount_digits or record.get("金額", ""),
         record.get("收文日期", ""),
     ]
     return "|".join(normalize_header(part) for part in parts)
@@ -2111,6 +2143,15 @@ TRIGGER_DATE_FIELDS = {
 OPENPYXL_DETAIL_COLUMNS = {field: index for index, field in enumerate(DETAIL_COLS, start=1)}
 OPENPYXL_PURPOSE_COLUMNS = list(range(20, 27))
 OPENPYXL_SUMMARY_COLUMNS = {"CI": 51, "CB": 52, "ECB": 53, "GDR": 54, "EB": 55}
+COMPARE_EVENT_BLUE_COLUMNS = {
+    "自動補正日期": "K",
+    "停止生效日期": "L",
+    "解除生效日期": "M",
+    "生效日期": "C",
+    "廢止/撤銷日期": "O",
+    "自行撤回日期": "P",
+    "退件日期": "Q",
+}
 
 
 def font_color_is_blue(color: object) -> bool:
@@ -2251,17 +2292,40 @@ def update_existing_detail_row(sheet: object, row_num: int, record: dict[str, st
             blue_cell(cell)
 
 
+def changed_value(old: str, new: str) -> bool:
+    old_norm = normalize_header(old)
+    new_norm = normalize_header(new)
+    return bool(new_norm) and old_norm != new_norm
+
+
+def compare_blue_columns(previous: dict[str, str] | None, current: dict[str, str]) -> set[int]:
+    if previous is None:
+        return {col_to_number("D")}
+    cols: set[int] = set()
+    for field, col_letter in COMPARE_EVENT_BLUE_COLUMNS.items():
+        if changed_value(previous.get(field, ""), current.get(field, "")):
+            cols.add(col_to_number(col_letter))
+    return cols
+
+
 def weekly_blue_columns(record: dict[str, str], start: dt.date, end: dt.date) -> set[int]:
     cols: set[int] = set()
     if in_range(record.get("收文日期", ""), start, end):
-        cols.update(range(1, 27))
-    date_hit = False
-    for field, col_letter in TRIGGER_DATE_FIELDS.items():
-        if in_range(record.get(field, ""), start, end):
-            date_hit = True
-            cols.add(col_to_number(col_letter))
-    if date_hit:
+        cols.add(col_to_number("D"))
+    if in_range(record.get("自動補正日期", ""), start, end):
+        cols.add(col_to_number("K"))
+    if in_range(record.get("停止生效日期", ""), start, end):
+        cols.add(col_to_number("L"))
+    if in_range(record.get("解除生效日期", ""), start, end):
+        cols.add(col_to_number("M"))
+    if in_range(record.get("生效日期", ""), start, end):
         cols.add(col_to_number("C"))
+    if in_range(record.get("廢止/撤銷日期", ""), start, end):
+        cols.add(col_to_number("O"))
+    if in_range(record.get("自行撤回日期", ""), start, end):
+        cols.add(col_to_number("P"))
+    if in_range(record.get("退件日期", ""), start, end):
+        cols.add(col_to_number("Q"))
     return cols
 
 
@@ -2275,7 +2339,14 @@ def detail_field_value(record: dict[str, str], field: str) -> str:
     return record.get(field, "")
 
 
-def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, str]], new_records: list[dict[str, str]], start: dt.date, end: dt.date) -> None:
+def update_summary_sheet_openpyxl(
+    sheet: object,
+    base_records: list[dict[str, str]],
+    new_records: list[dict[str, str]],
+    start: dt.date,
+    end: dt.date,
+    weekly_keys: set[str] | None = None,
+) -> None:
     sheet["BB1"] = f"更新日期：{roc_date(end)}"
     sheet["AX2"] = f"{roc_year(end)}.01.01~{roc_date(end)}"
     broker_rows: dict[str, int] = {}
@@ -2296,7 +2367,10 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
         name = record.get("顯示名稱") or record.get("公司名稱", "")
         by_broker[broker][code].append(name)
     for record in year_records:
-        if not weekly_blue_columns(record, start, end):
+        if weekly_keys is not None:
+            if record_key(record) not in weekly_keys:
+                continue
+        elif not weekly_blue_columns(record, start, end):
             continue
         broker = clean_broker(record.get("承銷商", "")) or "未填"
         code = record.get("分類", "其他")
@@ -2378,22 +2452,27 @@ def update_template_workbook_openpyxl(
     last_row = last_detail_row(detail_sheet)
     template_row = max(4, last_row)
     source_by_key = {record_key(record): record for record in base_records}
+    weekly_keys: set[str] = set()
     for key, record in source_by_key.items():
-        blue_cols = weekly_blue_columns(record, start, end)
         if key in existing_by_key:
             row_num, existing_record = existing_by_key[key]
+            blue_cols = compare_blue_columns(existing_record, record)
             if is_bond_product_name(existing_record.get("公司名稱", "")) and not is_bond_product_name(record.get("顯示名稱", "")):
                 record["顯示名稱"] = existing_record["公司名稱"]
             if record.get("分類") in ("CB", "ECB", "EB") and weekly_blue_columns(record, start, end) and not is_bond_product_name(record.get("顯示名稱", "")):
                 record["顯示名稱"] = missing_bond_display_name(record)
             if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
                 record["本次籌資計畫"] = existing_record["本次籌資計畫"]
+            if blue_cols:
+                weekly_keys.add(key)
             update_existing_detail_row(detail_sheet, row_num, record, blue_cols)
             continue
         last_row += 1
+        blue_cols = compare_blue_columns(None, record)
+        weekly_keys.add(key)
         write_detail_row(detail_sheet, last_row, record, blue_cols, template_row)
 
-    update_summary_sheet_openpyxl(summary_sheet, base_records, new_records, start, end)
+    update_summary_sheet_openpyxl(summary_sheet, base_records, new_records, start, end, weekly_keys)
     workbook.save(target)
     return target
 
@@ -2642,10 +2721,34 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     records = extract_records(source_path)
-    new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
-    amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
-    stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
-    effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
+    previous_records: list[dict[str, str]] = []
+    if base_path and base_path.exists():
+        try:
+            previous_records = extract_records(base_path)
+        except Exception:
+            previous_records = []
+    previous_by_key = {record_key(record): record for record in previous_records}
+    if previous_by_key:
+        new_records: list[dict[str, str]] = []
+        amend_records: list[dict[str, str]] = []
+        stop_records: list[dict[str, str]] = []
+        effective_records: list[dict[str, str]] = []
+        for record in records:
+            previous = previous_by_key.get(record_key(record))
+            if previous is None:
+                new_records.append(record)
+                continue
+            if changed_value(previous.get("自動補正日期", ""), record.get("自動補正日期", "")):
+                amend_records.append(record)
+            if changed_value(previous.get("停止生效日期", ""), record.get("停止生效日期", "")):
+                stop_records.append(record)
+            if changed_value(previous.get("生效日期", ""), record.get("生效日期", "")):
+                effective_records.append(record)
+    else:
+        new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
+        amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
+        stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
+        effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
     weekly_records = unique_records(new_records + amend_records + stop_records + effective_records)
     lookup_focus = {record_key(r) for r in weekly_records}
     purpose_focus = {record_key(r) for r in weekly_records}
