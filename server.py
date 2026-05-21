@@ -22,6 +22,8 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Font
 
 
@@ -440,7 +442,10 @@ def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: st
     name = parse_bond_short_from_text(text, record, company_short)
     if name:
         return name
-    return parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
+    name = parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
+    if name:
+        return name
+    return parse_bond_short_from_announcement(open_data_major_announcement_text(record), record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -460,6 +465,49 @@ def parse_purpose_from_text(text: str) -> str:
         if any(keyword in compact for keyword in keywords):
             purposes.append(label)
     return "；".join(dict.fromkeys(purposes))
+
+
+def funding_purpose_from_open_text(record: dict[str, str], text: str) -> str:
+    matched = matching_record_text(text, record)
+    return parse_purpose_from_text(matched)
+
+
+def open_data_major_announcement_text(record: dict[str, str]) -> str:
+    urls = (
+        "https://openapi.twse.com.tw/v1/opendata/t187ap04_L",
+        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O",
+        "https://www.tpex.org.tw/openapi/v1/t187ap04_O",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_L.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_O.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_P.csv",
+    )
+    security_code = record.get("證券代號", "")
+    texts: list[str] = []
+    for url in urls:
+        try:
+            raw = public_fetch_text(url, timeout=3)
+        except Exception:
+            continue
+        if not raw.strip():
+            continue
+        rows: list[dict[str, str]] = []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                rows = [row for row in data if isinstance(row, dict)]
+        except Exception:
+            try:
+                rows = list(csv.DictReader(io.StringIO(raw)))
+            except Exception:
+                rows = []
+        for row in rows:
+            code = str(row.get("公司代號") or row.get("證券代號") or row.get("公司代號/股票代號") or row.get("Code") or "").strip()
+            if code and code != security_code:
+                continue
+            joined = " ".join(str(value) for value in row.values() if value is not None)
+            if security_code in joined or any(token in normalize_header(joined) for token in record_identity_tokens(record)):
+                texts.append(joined)
+    return "\n".join(texts)
 
 
 def text_matches_record(text: str, record: dict[str, str]) -> bool:
@@ -560,17 +608,26 @@ def mops_major_announcement_text(record: dict[str, str], end: dt.date) -> str:
         dates.append(end)
     texts: list[str] = []
     for date in dates:
+        typek = "sii" if "上市" in record.get("公司型態", "") else ("otc" if "上櫃" in record.get("公司型態", "") else "all")
         params = {
             "encodeURIComponent": "1",
             "step": "1",
             "firstin": "1",
             "off": "1",
-            "TYPEK": "all",
+            "queryName": "COMPANY_ID",
+            "inpuType": "co_id",
+            "TYPEK": typek,
             "co_id": record.get("證券代號", ""),
             "year": f"{roc_year(date):03d}",
             "month": f"{date.month:02d}",
+            "b_date": "1",
+            "e_date": "31",
         }
         texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01", "/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
+        if typek != "all":
+            params_all = dict(params)
+            params_all["TYPEK"] = "all"
+            texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params_all))
     return "\n".join(texts)
 
 
@@ -626,7 +683,10 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
     purpose = parse_purpose_from_text(matching_record_text(text, record))
     if purpose:
         return purpose
-    return parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
+    purpose = parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
+    if purpose:
+        return purpose
+    return funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -1926,10 +1986,8 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
             names = [name for name in code_map.get(code, []) if name]
             weekly_names = set(weekly_by_broker.get(broker, {}).get(code, []))
             cell = sheet.cell(row_num, col_idx)
-            cell.value = "、".join(names)
+            cell.value = summary_rich_text(names, weekly_names)
             black_cell(cell)
-            if weekly_names and all(name in weekly_names for name in names):
-                blue_cell(cell)
 
     if "合計" in broker_rows:
         row_num = broker_rows["合計"]
@@ -1940,6 +1998,23 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
         sheet.cell(row_num, 50).value = sum(totals.values())
         for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
             sheet.cell(row_num, col_idx).value = totals[code]
+
+
+def summary_rich_text(names: list[str], weekly_names: set[str]) -> object:
+    if not names:
+        return ""
+    if not weekly_names:
+        return "、".join(names)
+    parts: list[object] = []
+    blue_font = InlineFont(color=BLUE_RGB)
+    for index, name in enumerate(names):
+        prefix = "、" if index else ""
+        text = prefix + name
+        if name in weekly_names:
+            parts.append(TextBlock(blue_font, text))
+        else:
+            parts.append(text)
+    return CellRichText(*parts)
 
 
 def update_template_workbook_openpyxl(
