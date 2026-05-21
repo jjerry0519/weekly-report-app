@@ -761,7 +761,6 @@ def normalize_stock_short_for_bond(value: str) -> str:
         ("國際", ""),
         ("精密", ""),
         ("電子", ""),
-        ("科技", "科"),
     )
     for suffix, replacement in suffix_rules:
         if base.endswith(suffix) and len(base) > len(suffix) + 1:
@@ -796,6 +795,19 @@ def normalize_bond_product_name(value: str, record: dict[str, str]) -> str:
     return text
 
 
+def clean_explicit_bond_short(value: str) -> str:
+    text = normalize_header(value)
+    text = re.split(r"[)）(（，,。；;：:\\s]", text)[0]
+    if not text or len(text) > 14:
+        return ""
+    bad_words = ("公告", "董事", "決議", "辦理", "發行", "公司", "債券", "代碼", "名稱", "資訊", "訊息")
+    if any(word in text for word in bad_words):
+        return ""
+    if re.search(r"\d{6,}", text):
+        return ""
+    return text
+
+
 def short_base_for_bond(record: dict[str, str], company_short: str = "") -> str:
     base = company_short or record.get("顯示名稱", "") or display_name_for_record(record) or record.get("公司名稱", "")
     return normalize_stock_short_for_bond(base)
@@ -808,17 +820,10 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
         return ""
     base = short_base_for_bond(record, company_short)
     for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s()（）]{2,24})", compact):
-        candidate = match.group(1).strip()
-        if candidate and not any(word in candidate for word in ("公司", "股票", "債券")):
+        candidate = clean_explicit_bond_short(match.group(1))
+        if candidate:
             return normalize_bond_product_name(candidate, record)
     bond_pattern = r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,80}?(?:(?:有|無)?擔保)?(?:可)?(?:轉換|交換)公司債"
-    for match in re.finditer(rf"([\u4e00-\u9fffA-Za-z0-9-]{{2,40}}?)(?:股份有限公司)?{bond_pattern}", compact):
-        base_candidate = company_short or match.group(1)
-        base_candidate = re.split(r"[：:，,。；;]", base_candidate)[-1]
-        ordinal = chinese_ordinal_to_short(match.group(2))
-        name = bond_name_with_ordinal(base_candidate, ordinal, record)
-        if name:
-            return name
     for match in re.finditer(bond_pattern, compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
