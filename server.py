@@ -414,22 +414,28 @@ def parse_purpose_from_text(text: str) -> str:
 
 
 def text_matches_record(text: str, record: dict[str, str]) -> bool:
-    compact = normalize_header(html_to_text(text))
-    if not compact:
-        return False
+    return bool(matching_record_text(text, record))
+
+
+def record_identity_tokens(record: dict[str, str]) -> list[str]:
     identities = [
         record.get("證券代號", ""),
         record.get("顯示名稱", ""),
         record.get("公司名稱", ""),
         display_name_for_record(record),
     ]
-    identities = [normalize_header(item).replace("F-", "").replace("-KY", "") for item in identities if item]
-    has_identity = any(item and item in compact for item in identities)
-    if not has_identity:
-        return False
+    tokens: list[str] = []
+    for item in identities:
+        token = normalize_header(item).replace("F-", "").replace("-KY", "")
+        if token and token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def record_amount_tokens(record: dict[str, str]) -> set[str]:
     amount = re.sub(r"\D", "", record.get("金額", ""))
     if not amount:
-        return True
+        return set()
     amount_tokens = {amount}
     try:
         value = int(amount)
@@ -439,8 +445,37 @@ def text_matches_record(text: str, record: dict[str, str]) -> bool:
             amount_tokens.add(str(value // 1000000))
     except ValueError:
         pass
-    compact_digits = re.sub(r"\D", "", compact)
-    return any(token and token in compact_digits for token in amount_tokens)
+    return {token for token in amount_tokens if token}
+
+
+def matching_record_text(text: str, record: dict[str, str]) -> str:
+    compact = normalize_header(html_to_text(text))
+    if not compact:
+        return ""
+    identities = record_identity_tokens(record)
+    if not identities:
+        return ""
+    identity_positions = [
+        match.start()
+        for token in identities
+        for match in re.finditer(re.escape(token), compact)
+        if token
+    ]
+    if not identity_positions:
+        return ""
+    amount_tokens = record_amount_tokens(record)
+    if not amount_tokens:
+        return compact if identity_positions else ""
+
+    matched: list[str] = []
+    for token in sorted(amount_tokens, key=len, reverse=True):
+        for match in re.finditer(re.escape(token), compact):
+            pos = match.start()
+            if any(abs(pos - identity_pos) <= 1400 for identity_pos in identity_positions):
+                start = max(0, pos - 1800)
+                end = min(len(compact), pos + 1800)
+                matched.append(compact[start:end])
+    return " ".join(dict.fromkeys(matched))
 
 
 def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
@@ -455,12 +490,13 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
         "month": f"{received.month:02d}",
     }
     text = mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params)
-    purpose = parse_purpose_from_text(text) if text_matches_record(text, record) else ""
+    matched_text = matching_record_text(text, record)
+    purpose = parse_purpose_from_text(matched_text)
     if purpose:
         return purpose
     paths = ("/mops/web/ajax_t116sb01", "/mops/web/ajax_t108sb16")
     text = mops_query_text(paths, params)
-    return parse_purpose_from_text(text) if text_matches_record(text, record) else ""
+    return parse_purpose_from_text(matching_record_text(text, record))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -476,12 +512,16 @@ def display_name_for_record(record: dict[str, str]) -> str:
     return company
 
 
-def online_mops_lookup(record: dict[str, str], end: dt.date, need_name: bool, need_purpose: bool) -> dict[str, str]:
+def online_mops_lookup(record: dict[str, str], end: dt.date, need_company_short: bool, need_bond_name: bool, need_purpose: bool) -> dict[str, str]:
     result: dict[str, str] = {}
-    if need_name:
+    if need_company_short:
+        short_name = public_company_short_name(record.get("證券代號", ""))
+        if short_name:
+            result["company_short"] = short_name
+    if need_bond_name:
         name = mops_bond_short_name(record, end)
         if name:
-            result["name"] = name
+            result["bond_name"] = name
     if need_purpose:
         purpose = mops_funding_purpose(record, end)
         if purpose:
@@ -497,48 +537,58 @@ def enrich_records(
 ) -> list[str]:
     warnings: list[str] = []
     end = end or latest_thursday()
-    lookup_jobs: list[tuple[dict[str, str], tuple[str, str, str], bool, bool]] = []
+    lookup_jobs: list[tuple[dict[str, str], tuple[str, str, str], bool, bool, bool]] = []
     for record in records:
         key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
         data = MOPS_ENRICHMENTS.get(key)
+        is_focus = focus_keys is None or record_key(record) in focus_keys
         wants_fresh_purpose = purpose_keys is None or record_key(record) in purpose_keys
-        if not data:
+        if is_focus:
+            record["顯示名稱"] = display_name_for_record(record)
+            if wants_fresh_purpose:
+                record["本次籌資計畫"] = ""
+        elif not data:
             record["顯示名稱"] = display_name_for_record(record)
         else:
             record["顯示名稱"] = data["display"]
-            if not wants_fresh_purpose:
-                record["本次籌資計畫"] = data["purpose"]
+            record["本次籌資計畫"] = data["purpose"]
         if focus_keys is not None and record_key(record) not in focus_keys:
             continue
-        need_name = record.get("分類") in ("CB", "ECB", "EB") and key not in BOND_SHORT_NAMES
-        need_purpose = wants_fresh_purpose and not record.get("本次籌資計畫", "").strip()
+        need_company_short = True
+        need_bond_name = record.get("分類") in ("CB", "ECB", "EB")
+        need_purpose = wants_fresh_purpose
         if not ENABLE_ONLINE_MOPS_LOOKUP:
-            if need_name and not data:
-                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未啟用線上 MOPS 補查，已先用公司簡稱。")
+            warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：線上查詢未啟用；本工具要求線上查詢，請開啟 ENABLE_ONLINE_MOPS_LOOKUP。")
+            if need_bond_name:
+                warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未查詢 MOPS 第幾次名稱，請勿直接採用備援名稱。")
             if need_purpose:
-                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未啟用線上 MOPS 補查，請人工確認本次籌資計畫。")
+                warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未查詢 MOPS 本次籌資計畫，已留白避免查錯。")
             continue
-        if need_name or need_purpose:
-            lookup_jobs.append((record, key, need_name, need_purpose))
+        lookup_jobs.append((record, key, need_company_short, need_bond_name, need_purpose))
     if ENABLE_ONLINE_MOPS_LOOKUP and lookup_jobs:
         workers = max(1, min(MAX_MOPS_WORKERS, len(lookup_jobs)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {
-                executor.submit(online_mops_lookup, record.copy(), end, need_name, need_purpose): (record, key, need_name, need_purpose)
-                for record, key, need_name, need_purpose in lookup_jobs
+                executor.submit(online_mops_lookup, record.copy(), end, need_company_short, need_bond_name, need_purpose): (record, key, need_company_short, need_bond_name, need_purpose)
+                for record, key, need_company_short, need_bond_name, need_purpose in lookup_jobs
             }
             for future in concurrent.futures.as_completed(futures):
-                record, key, need_name, need_purpose = futures[future]
+                record, key, need_company_short, need_bond_name, need_purpose = futures[future]
                 try:
                     result = future.result()
                 except Exception as exc:
                     warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 查詢失敗，請人工確認。{exc}")
                     continue
-                if need_name:
-                    if result.get("name"):
-                        record["顯示名稱"] = result["name"]
+                if need_company_short:
+                    if result.get("company_short"):
+                        record["顯示名稱"] = result["company_short"]
                     else:
-                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到債券商品簡稱，已先用公司簡稱。")
+                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：TWSE/TPEx 查不到公司簡稱，已先用來源檔公司名稱。")
+                if need_bond_name:
+                    if result.get("bond_name"):
+                        record["顯示名稱"] = result["bond_name"]
+                    else:
+                        warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱，已先用公司簡稱並列入待確認。")
                 if need_purpose:
                     if result.get("purpose"):
                         record["本次籌資計畫"] = result["purpose"]
