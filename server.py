@@ -16,10 +16,13 @@ import tempfile
 import urllib.parse
 import urllib.request
 import zipfile
-from copy import deepcopy
+from copy import copy as copy_style, deepcopy
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from xml.etree import ElementTree as ET
+
+from openpyxl import load_workbook
+from openpyxl.styles import Font
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -294,9 +297,15 @@ def public_fetch_text(url: str, data: dict[str, str] | None = None, timeout: int
         encoded = urllib.parse.urlencode(data).encode("utf-8")
         headers["Content-Type"] = "application/x-www-form-urlencoded"
     req = urllib.request.Request(url, data=encoded, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        charset = resp.headers.get_content_charset() or "utf-8"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+    except Exception:
+        if data is not None:
+            raise
+        raw = fetch_with_windows(url, attempt_timeout=max(5, min(timeout + 2, 8)))
+        charset = "utf-8"
     for candidate in (charset, "utf-8", "big5", "cp950"):
         try:
             return raw.decode(candidate)
@@ -427,7 +436,11 @@ def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: st
         params_end["year"] = f"{roc_year(end):03d}"
         params_end["month"] = f"{end.month:02d}"
         texts.append(mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params_end))
-    return parse_bond_short_from_text("\n".join(texts), record, company_short)
+    text = "\n".join(texts)
+    name = parse_bond_short_from_text(text, record, company_short)
+    if name:
+        return name
+    return parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -484,6 +497,22 @@ def record_amount_tokens(record: dict[str, str]) -> set[str]:
     return {token for token in amount_tokens if token}
 
 
+def record_case_tokens(record: dict[str, str]) -> list[str]:
+    code = record.get("分類", "")
+    case_type = normalize_header(record.get("案件類別", ""))
+    if code == "CI":
+        return ["現金增資"]
+    if code == "CB":
+        return ["轉換公司債"]
+    if code == "ECB":
+        return ["海外轉換公司債", "轉換公司債"]
+    if code == "EB":
+        return ["交換公司債"]
+    if code == "GDR":
+        return ["海外存託憑證", "存託憑證"]
+    return [case_type] if case_type else []
+
+
 def matching_record_text(text: str, record: dict[str, str]) -> str:
     compact = normalize_header(html_to_text(text))
     if not compact:
@@ -511,7 +540,69 @@ def matching_record_text(text: str, record: dict[str, str]) -> str:
                 start = max(0, pos - 1800)
                 end = min(len(compact), pos + 1800)
                 matched.append(compact[start:end])
+    if matched:
+        return " ".join(dict.fromkeys(matched))
+    case_tokens = [token for token in record_case_tokens(record) if token]
+    for token in case_tokens:
+        for match in re.finditer(re.escape(token), compact):
+            pos = match.start()
+            if any(abs(pos - identity_pos) <= 1800 for identity_pos in identity_positions):
+                start = max(0, pos - 2200)
+                end = min(len(compact), pos + 2200)
+                matched.append(compact[start:end])
     return " ".join(dict.fromkeys(matched))
+
+
+def mops_major_announcement_text(record: dict[str, str], end: dt.date) -> str:
+    received = parse_date(record.get("收文日期", "")) or end
+    dates = [received]
+    if received.month != end.month or received.year != end.year:
+        dates.append(end)
+    texts: list[str] = []
+    for date in dates:
+        params = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "1",
+            "off": "1",
+            "TYPEK": "all",
+            "co_id": record.get("證券代號", ""),
+            "year": f"{roc_year(date):03d}",
+            "month": f"{date.month:02d}",
+        }
+        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01", "/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
+    return "\n".join(texts)
+
+
+def chinese_ordinal_to_short(value: str) -> str:
+    text = normalize_header(value)
+    if text.isdigit():
+        number = int(text)
+        digits = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十"]
+        return digits[number] if 0 <= number <= 10 else text
+    return text
+
+
+def short_base_for_bond(record: dict[str, str], company_short: str = "") -> str:
+    base = company_short or record.get("顯示名稱", "") or display_name_for_record(record) or record.get("公司名稱", "")
+    base = base.replace("F-", "").strip()
+    for suffix in ("國際科技", "電子股份有限公司", "股份有限公司"):
+        if base.endswith(suffix) and len(base) > len(suffix) + 1:
+            base = base[: -len(suffix)]
+    return base
+
+
+def parse_bond_short_from_announcement(text: str, record: dict[str, str], company_short: str = "") -> str:
+    matched_text = matching_record_text(text, record)
+    compact = normalize_header(html_to_text(matched_text or text))
+    if not compact:
+        return ""
+    base = short_base_for_bond(record, company_short)
+    for match in re.finditer(r"第([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
+        ordinal = chinese_ordinal_to_short(match.group(1))
+        if base:
+            return f"{base}{ordinal}"
+    return ""
 
 
 def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
@@ -532,7 +623,10 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
         return purpose
     paths = ("/mops/web/ajax_t116sb01", "/mops/web/ajax_t108sb16")
     text = mops_query_text(paths, params)
-    return parse_purpose_from_text(matching_record_text(text, record))
+    purpose = parse_purpose_from_text(matching_record_text(text, record))
+    if purpose:
+        return purpose
+    return parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -810,20 +904,25 @@ def fetch_bytes(url: str) -> bytes:
         return fetch_with_windows(url)
 
 
-def fetch_with_windows(url: str) -> bytes:
+def fetch_with_windows(url: str, attempt_timeout: int = 25) -> bytes:
     errors: list[str] = []
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp_path = tmp.name
     try:
-        methods = [
-            ("PowerShell Invoke-WebRequest", powershell_download_command(url, tmp_path, "iwr")),
-            ("PowerShell WebClient", powershell_download_command(url, tmp_path, "webclient")),
-            ("curl.exe", ["curl.exe", "-L", "--retry", "1", "--connect-timeout", "8", "--max-time", "25", "-A", "Mozilla/5.0", "-o", tmp_path, url]),
-            ("certutil", ["certutil.exe", "-urlcache", "-split", "-f", url, tmp_path]),
-        ]
+        if attempt_timeout <= 8:
+            methods = [
+                ("curl.exe", ["curl.exe", "-L", "--retry", "0", "--connect-timeout", str(max(2, attempt_timeout // 2)), "--max-time", str(attempt_timeout), "-A", "Mozilla/5.0", "-o", tmp_path, url]),
+            ]
+        else:
+            methods = [
+                ("PowerShell Invoke-WebRequest", powershell_download_command(url, tmp_path, "iwr")),
+                ("PowerShell WebClient", powershell_download_command(url, tmp_path, "webclient")),
+                ("curl.exe", ["curl.exe", "-L", "--retry", "1", "--connect-timeout", "8", "--max-time", str(attempt_timeout), "-A", "Mozilla/5.0", "-o", tmp_path, url]),
+                ("certutil", ["certutil.exe", "-urlcache", "-split", "-f", url, tmp_path]),
+            ]
         for label, command in methods:
             try:
-                completed = subprocess.run(command, check=True, timeout=25, capture_output=True)
+                completed = subprocess.run(command, check=True, timeout=attempt_timeout, capture_output=True)
                 data = Path(tmp_path).read_bytes()
                 if data:
                     return data
@@ -1622,6 +1721,271 @@ def split_purpose(record: dict[str, str]) -> list[str]:
     return columns
 
 
+TRIGGER_DATE_FIELDS = {
+    "自動補正日期": "K",
+    "停止生效日期": "L",
+    "解除生效日期": "M",
+    "生效日期": "N",
+    "廢止/撤銷日期": "O",
+    "自行撤回日期": "P",
+    "退件日期": "Q",
+}
+OPENPYXL_DETAIL_COLUMNS = {field: index for index, field in enumerate(DETAIL_COLS, start=1)}
+OPENPYXL_PURPOSE_COLUMNS = list(range(20, 27))
+OPENPYXL_SUMMARY_COLUMNS = {"CI": 51, "CB": 52, "ECB": 53, "GDR": 54, "EB": 55}
+
+
+def font_color_is_blue(color: object) -> bool:
+    if color is None:
+        return False
+    color_type = getattr(color, "type", None)
+    if color_type == "rgb":
+        return is_blue_rgb(str(getattr(color, "rgb", "") or ""))
+    if color_type == "indexed":
+        return getattr(color, "indexed", None) == 4
+    return False
+
+
+def set_cell_font_color(cell: object, rgb: str) -> None:
+    font = copy_style(cell.font)
+    font.color = rgb
+    cell.font = font
+
+
+def blue_cell(cell: object) -> None:
+    set_cell_font_color(cell, BLUE_RGB)
+
+
+def black_cell(cell: object) -> None:
+    if font_color_is_blue(cell.font.color):
+        set_cell_font_color(cell, BLACK_RGB)
+
+
+def clear_workbook_blue_fonts(workbook: object) -> None:
+    for worksheet in workbook.worksheets:
+        max_col = min(worksheet.max_column or 1, 80)
+        for row in worksheet.iter_rows(min_row=1, max_row=worksheet.max_row or 1, max_col=max_col):
+            for cell in row:
+                black_cell(cell)
+
+
+def safe_load_workbook(path: Path):
+    try:
+        return load_workbook(path)
+    except TypeError:
+        sanitized = Path(tempfile.gettempdir()) / f"sanitized_{dt.datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{path.name}"
+        sanitize_shared_strings(path, sanitized)
+        return load_workbook(sanitized)
+
+
+def sanitize_shared_strings(source: Path, target: Path) -> None:
+    with zipfile.ZipFile(source, "r") as zin, zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+        for name in zin.namelist():
+            data = zin.read(name)
+            if name == "xl/sharedStrings.xml":
+                text = data.decode("utf-8")
+
+                def flatten_si(match: re.Match[str]) -> str:
+                    si = match.group(0)
+                    if "<r>" not in si:
+                        return si
+                    value = "".join(html.unescape(t) for t in re.findall(r"<t[^>]*>([\s\S]*?)</t>", si))
+                    return f"<si><t>{escape_xml_text(value)}</t></si>"
+
+                data = re.sub(r"<si>[\s\S]*?</si>", flatten_si, text).encode("utf-8")
+            zout.writestr(name, data)
+
+
+def copy_cell_style(source_cell: object, target_cell: object) -> None:
+    target_cell.font = copy_style(source_cell.font)
+    target_cell.fill = copy_style(source_cell.fill)
+    target_cell.border = copy_style(source_cell.border)
+    target_cell.alignment = copy_style(source_cell.alignment)
+    target_cell.number_format = source_cell.number_format
+    target_cell.protection = copy_style(source_cell.protection)
+
+
+def find_openpyxl_detail_sheet(workbook: object, end: dt.date):
+    preferred = f"{roc_year(end)}年本次籌資計畫"
+    if preferred in workbook.sheetnames:
+        return workbook[preferred]
+    for sheet in workbook.worksheets:
+        if "本次籌資計畫" in sheet.title:
+            return sheet
+    return workbook.worksheets[1] if len(workbook.worksheets) > 1 else workbook.active
+
+
+def find_openpyxl_summary_sheet(workbook: object, end: dt.date):
+    preferred = f"{roc_year(end)}年"
+    if preferred in workbook.sheetnames:
+        return workbook[preferred]
+    return workbook.worksheets[0]
+
+
+def detail_row_record_from_sheet(sheet: object, row_num: int) -> dict[str, str]:
+    values = {
+        col: "" if sheet[f"{col}{row_num}"].value is None else str(sheet[f"{col}{row_num}"].value).strip()
+        for col in [number_to_col(i) for i in range(1, 27)]
+    }
+    return detail_row_to_record(values)
+
+
+def last_detail_row(sheet: object) -> int:
+    last = 4
+    for row_num in range(4, sheet.max_row + 1):
+        code = sheet.cell(row_num, 1).value
+        name = sheet.cell(row_num, 4).value
+        if str(code or "").strip() or str(name or "").strip():
+            last = row_num
+    return last
+
+
+def write_detail_row(sheet: object, row_num: int, record: dict[str, str], blue_cols: set[int], template_row: int) -> None:
+    for col_idx in range(1, 27):
+        copy_cell_style(sheet.cell(template_row, col_idx), sheet.cell(row_num, col_idx))
+        black_cell(sheet.cell(row_num, col_idx))
+    for field, col_letter in DETAIL_COLS.items():
+        cell = sheet[f"{col_letter}{row_num}"]
+        cell.value = record.get(field, "")
+        if col_to_number(col_letter) in blue_cols and str(cell.value or "").strip():
+            blue_cell(cell)
+    purpose_values = split_purpose(record)
+    for idx, col_idx in enumerate(OPENPYXL_PURPOSE_COLUMNS):
+        cell = sheet.cell(row_num, col_idx)
+        cell.value = purpose_values[idx] if idx < len(purpose_values) else ""
+        if col_idx in blue_cols and str(cell.value or "").strip():
+            blue_cell(cell)
+
+
+def update_existing_detail_row(sheet: object, row_num: int, record: dict[str, str], blue_cols: set[int]) -> None:
+    for field, col_letter in DETAIL_COLS.items():
+        cell = sheet[f"{col_letter}{row_num}"]
+        cell.value = record.get(field, "")
+        black_cell(cell)
+        if col_to_number(col_letter) in blue_cols and str(cell.value or "").strip():
+            blue_cell(cell)
+    purpose_values = split_purpose(record)
+    for idx, col_idx in enumerate(OPENPYXL_PURPOSE_COLUMNS):
+        cell = sheet.cell(row_num, col_idx)
+        cell.value = purpose_values[idx] if idx < len(purpose_values) else ""
+        black_cell(cell)
+        if col_idx in blue_cols and str(cell.value or "").strip():
+            blue_cell(cell)
+
+
+def weekly_blue_columns(record: dict[str, str], start: dt.date, end: dt.date) -> set[int]:
+    cols: set[int] = set()
+    if in_range(record.get("收文日期", ""), start, end):
+        cols.update(range(1, 27))
+    date_hit = False
+    for field, col_letter in TRIGGER_DATE_FIELDS.items():
+        if in_range(record.get(field, ""), start, end):
+            date_hit = True
+            cols.add(col_to_number(col_letter))
+    if date_hit:
+        cols.add(col_to_number("C"))
+    return cols
+
+
+def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, str]], new_records: list[dict[str, str]], start: dt.date, end: dt.date) -> None:
+    sheet["BB1"] = f"更新日期：{roc_date(end)}"
+    sheet["AX2"] = f"{roc_year(end)}.01.01~{roc_date(end)}"
+    broker_rows: dict[str, int] = {}
+    for row_num in range(4, sheet.max_row + 1):
+        broker = clean_broker(str(sheet.cell(row_num, 1).value or ""))
+        if broker:
+            broker_rows[broker] = row_num
+
+    year_records = [r for r in base_records if (parse_date(r.get("收文日期", "")) or start) <= end]
+    by_broker: dict[str, dict[str, list[str]]] = {}
+    weekly_by_broker: dict[str, dict[str, list[str]]] = {}
+    for record in year_records:
+        broker = clean_broker(record.get("承銷商", "")) or "未填"
+        code = record.get("分類", "其他")
+        if code not in OPENPYXL_SUMMARY_COLUMNS:
+            continue
+        by_broker.setdefault(broker, {key: [] for key in OPENPYXL_SUMMARY_COLUMNS})
+        name = record.get("顯示名稱") or record.get("公司名稱", "")
+        by_broker[broker][code].append(name)
+    for record in new_records:
+        broker = clean_broker(record.get("承銷商", "")) or "未填"
+        code = record.get("分類", "其他")
+        if code not in OPENPYXL_SUMMARY_COLUMNS:
+            continue
+        weekly_by_broker.setdefault(broker, {key: [] for key in OPENPYXL_SUMMARY_COLUMNS})
+        name = record.get("顯示名稱") or record.get("公司名稱", "")
+        weekly_by_broker[broker][code].append(name)
+
+    for broker, code_map in by_broker.items():
+        if broker not in broker_rows or broker == "合計":
+            continue
+        row_num = broker_rows[broker]
+        total = sum(len(items) for items in code_map.values())
+        sheet.cell(row_num, 50).value = total
+        for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
+            names = [name for name in code_map.get(code, []) if name]
+            weekly_names = set(weekly_by_broker.get(broker, {}).get(code, []))
+            cell = sheet.cell(row_num, col_idx)
+            cell.value = "、".join(names)
+            black_cell(cell)
+            if weekly_names and all(name in weekly_names for name in names):
+                blue_cell(cell)
+
+    if "合計" in broker_rows:
+        row_num = broker_rows["合計"]
+        totals = {
+            code: sum(len(code_map.get(code, [])) for code_map in by_broker.values())
+            for code in OPENPYXL_SUMMARY_COLUMNS
+        }
+        sheet.cell(row_num, 50).value = sum(totals.values())
+        for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
+            sheet.cell(row_num, col_idx).value = totals[code]
+
+
+def update_template_workbook_openpyxl(
+    source_path: Path,
+    start: dt.date,
+    end: dt.date,
+    source_url: str,
+    template_path: Path | None,
+    base_records: list[dict[str, str]],
+    new_records: list[dict[str, str]],
+    amend_records: list[dict[str, str]],
+    stop_records: list[dict[str, str]],
+    effective_records: list[dict[str, str]],
+    counts: dict[str, int],
+) -> Path:
+    template = template_path if template_path and template_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path)
+    filename = f"同業送件明細(截至{compact_roc_date(end)}).xlsx"
+    target = available_report_path(REPORT_DIR / filename)
+    workbook = safe_load_workbook(template)
+    clear_workbook_blue_fonts(workbook)
+    detail_sheet = find_openpyxl_detail_sheet(workbook, end)
+    summary_sheet = find_openpyxl_summary_sheet(workbook, end)
+
+    existing_by_key: dict[str, int] = {}
+    for row_num in range(4, detail_sheet.max_row + 1):
+        record = detail_row_record_from_sheet(detail_sheet, row_num)
+        key = record_key(record)
+        if key.strip("|"):
+            existing_by_key[key] = row_num
+
+    last_row = last_detail_row(detail_sheet)
+    template_row = max(4, last_row)
+    source_by_key = {record_key(record): record for record in base_records}
+    for key, record in source_by_key.items():
+        blue_cols = weekly_blue_columns(record, start, end)
+        if key in existing_by_key:
+            update_existing_detail_row(detail_sheet, existing_by_key[key], record, blue_cols)
+            continue
+        last_row += 1
+        write_detail_row(detail_sheet, last_row, record, blue_cols, template_row)
+
+    update_summary_sheet_openpyxl(summary_sheet, base_records, new_records, start, end)
+    workbook.save(target)
+    return target
+
+
 def update_template_workbook(
     source_path: Path,
     start: dt.date,
@@ -1635,6 +1999,20 @@ def update_template_workbook(
     effective_records: list[dict[str, str]],
     counts: dict[str, int],
 ) -> Path:
+    return update_template_workbook_openpyxl(
+        source_path,
+        start,
+        end,
+        source_url,
+        template_path,
+        base_records,
+        new_records,
+        amend_records,
+        stop_records,
+        effective_records,
+        counts,
+    )
+
     template = template_path if template_path and template_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path)
     filename = f"同業送件明細(截至{compact_roc_date(end)}).xlsx"
     target = available_report_path(REPORT_DIR / filename)
