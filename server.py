@@ -533,7 +533,14 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
     identity = " ".join(token for token in record_identity_tokens(record)[:3] if token)
     amount = record.get("金額", "")
     case_terms = " ".join(record_case_tokens(record))
+    company = record.get("公司名稱", "")
+    code = record.get("證券代號", "")
     queries = [
+        f"{code} {company} 國內第 轉換公司債 簡稱",
+        f"{code} {company} 債券簡稱 代碼 轉換公司債",
+        f"{company} 國內第 次 無擔保 有擔保 轉換公司債",
+        f"{company} 公告 本公司 國內第 轉換公司債",
+        f"{company} 代收價款 存儲專戶 轉換公司債",
         f"{record.get('證券代號', '')} 債券簡稱 轉換公司債 代碼",
         f"{identity} 國內 第 次 轉換公司債 債券簡稱",
         f"{identity} {case_terms} {amount} 募得價款 用途 第幾次",
@@ -795,6 +802,74 @@ def normalize_bond_product_name(value: str, record: dict[str, str]) -> str:
     return text
 
 
+def is_bond_product_name(value: str) -> bool:
+    text = normalize_header(value)
+    if not text or len(text) > 18:
+        return False
+    if any(word in text for word in ("公告", "公司", "證券", "科技股份", "待確認")):
+        return False
+    return bool(re.search(r"(海外)?[一二三四五六七八九十百\d]+(?:-KY)?$", text))
+
+
+def bond_ordinals_from_text(text: str) -> list[str]:
+    compact = normalize_header(html_to_text(text))
+    ordinals: list[str] = []
+    patterns = (
+        r"第([一二三四五六七八九十百\d]+)次及第([一二三四五六七八九十百\d]+)次",
+        r"第([一二三四五六七八九十百\d]+)次",
+        r"國內([一二三四五六七八九十百\d]+)次",
+        r"海外([一二三四五六七八九十百\d]+)次",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, compact):
+            for group in match.groups():
+                if not group:
+                    continue
+                ordinal = chinese_ordinal_to_short(group)
+                if ordinal not in ordinals:
+                    ordinals.append(ordinal)
+    return ordinals
+
+
+def bond_lookup_required(record: dict[str, str], focus_keys: set[str] | None) -> bool:
+    return (
+        record.get("分類") in ("CB", "ECB", "EB")
+        and (focus_keys is None or record_key(record) in focus_keys)
+        and not is_bond_product_name(record.get("顯示名稱", ""))
+    )
+
+
+def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focus_keys: set[str] | None, warnings: list[str]) -> None:
+    groups: dict[str, list[dict[str, str]]] = {}
+    for record in records:
+        if not bond_lookup_required(record, focus_keys):
+            continue
+        group_key = "|".join((record.get("證券代號", ""), record.get("公司名稱", ""), record.get("分類", "")))
+        groups.setdefault(group_key, []).append(record)
+    for group in groups.values():
+        search_text = public_search_text(group[0], end)
+        explicit = parse_bond_short_from_announcement(search_text, group[0], public_company_short_name(group[0].get("證券代號", "")))
+        if len(group) == 1 and is_bond_product_name(explicit):
+            group[0]["顯示名稱"] = explicit
+            continue
+        ordinals = bond_ordinals_from_text(search_text)
+        if len(ordinals) >= len(group):
+            company_short = public_company_short_name(group[0].get("證券代號", "")) or group[0].get("顯示名稱", "") or group[0].get("公司名稱", "")
+            for record, ordinal in zip(group, ordinals):
+                record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
+            continue
+        for record in group:
+            record["顯示名稱"] = missing_bond_display_name(record)
+            warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：CB/ECB 商品次數未查到，已標示 MOPS待確認。")
+
+
+def missing_bond_display_name(record: dict[str, str]) -> str:
+    base = normalize_stock_short_for_bond(record.get("顯示名稱") or display_name_for_record(record) or record.get("公司名稱", ""))
+    if base.startswith("MOPS待確認："):
+        base = base.removeprefix("MOPS待確認：")
+    return f"MOPS待確認：{base or record.get('公司名稱', '')}"
+
+
 def clean_explicit_bond_short(value: str) -> str:
     text = normalize_header(value)
     text = re.split(r"[)）(（，,。；;：:\\s]", text)[0]
@@ -925,6 +1000,7 @@ def enrich_records(
         if not ENABLE_ONLINE_MOPS_LOOKUP:
             warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：線上查詢未啟用；本工具要求線上查詢，請開啟 ENABLE_ONLINE_MOPS_LOOKUP。")
             if need_bond_name:
+                record["顯示名稱"] = missing_bond_display_name(record)
                 warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未查詢 MOPS 第幾次名稱，請勿直接採用備援名稱。")
             if need_purpose:
                 warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未查詢 MOPS 本次籌資計畫，已留白避免查錯。")
@@ -953,12 +1029,14 @@ def enrich_records(
                     if result.get("bond_name"):
                         record["顯示名稱"] = result["bond_name"]
                     else:
+                        record["顯示名稱"] = missing_bond_display_name(record)
                         warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱，已先用公司簡稱並列入待確認。")
                 if need_purpose:
                     if result.get("purpose"):
                         record["本次籌資計畫"] = result["purpose"]
                     else:
                         warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 找不到可精準比對的本次籌資計畫，已留白避免查錯，請人工確認。")
+        resolve_missing_bond_names(records, end, focus_keys, warnings)
     return warnings
 
 
@@ -2090,7 +2168,7 @@ def write_detail_row(sheet: object, row_num: int, record: dict[str, str], blue_c
         black_cell(sheet.cell(row_num, col_idx))
     for field, col_letter in DETAIL_COLS.items():
         cell = sheet[f"{col_letter}{row_num}"]
-        cell.value = record.get(field, "")
+        cell.value = detail_field_value(record, field)
         if col_to_number(col_letter) in blue_cols and str(cell.value or "").strip():
             blue_cell(cell)
     purpose_values = split_purpose(record)
@@ -2104,7 +2182,7 @@ def write_detail_row(sheet: object, row_num: int, record: dict[str, str], blue_c
 def update_existing_detail_row(sheet: object, row_num: int, record: dict[str, str], blue_cols: set[int]) -> None:
     for field, col_letter in DETAIL_COLS.items():
         cell = sheet[f"{col_letter}{row_num}"]
-        cell.value = record.get(field, "")
+        cell.value = detail_field_value(record, field)
         black_cell(cell)
         if col_to_number(col_letter) in blue_cols and str(cell.value or "").strip():
             blue_cell(cell)
@@ -2129,6 +2207,14 @@ def weekly_blue_columns(record: dict[str, str], start: dt.date, end: dt.date) ->
     if date_hit:
         cols.add(col_to_number("C"))
     return cols
+
+
+def detail_field_value(record: dict[str, str], field: str) -> str:
+    if field == "公司名稱" and record.get("分類") in ("CB", "ECB", "EB"):
+        display = record.get("顯示名稱", "")
+        if is_bond_product_name(display) or display.startswith("MOPS待確認："):
+            return display
+    return record.get(field, "")
 
 
 def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, str]], new_records: list[dict[str, str]], start: dt.date, end: dt.date) -> None:
@@ -2238,8 +2324,11 @@ def update_template_workbook_openpyxl(
         blue_cols = weekly_blue_columns(record, start, end)
         if key in existing_by_key:
             row_num, existing_record = existing_by_key[key]
+            if is_bond_product_name(existing_record.get("公司名稱", "")) and not is_bond_product_name(record.get("顯示名稱", "")):
+                record["顯示名稱"] = existing_record["公司名稱"]
+            if record.get("分類") in ("CB", "ECB", "EB") and weekly_blue_columns(record, start, end) and not is_bond_product_name(record.get("顯示名稱", "")):
+                record["顯示名稱"] = missing_bond_display_name(record)
             if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
-                record = dict(record)
                 record["本次籌資計畫"] = existing_record["本次籌資計畫"]
             update_existing_detail_row(detail_sheet, row_num, record, blue_cols)
             continue
