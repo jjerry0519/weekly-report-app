@@ -331,6 +331,12 @@ def public_company_short_name(security_code: str) -> str:
         "https://www.tpex.org.tw/openapi/v1/t187ap03_O",
     )
     csv_urls = (
+        "https://dts.twse.com.tw/opendata/t187ap03_L.csv",
+        "https://dts.twse.com.tw/opendata/t187ap03_O.csv",
+        "https://dts.twse.com.tw/opendata/t187ap03_P.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_L.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_O.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_P.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_P.csv",
@@ -477,6 +483,12 @@ def open_data_major_announcement_text(record: dict[str, str]) -> str:
         "https://openapi.twse.com.tw/v1/opendata/t187ap04_L",
         "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O",
         "https://www.tpex.org.tw/openapi/v1/t187ap04_O",
+        "https://dts.twse.com.tw/opendata/t187ap04_L.csv",
+        "https://dts.twse.com.tw/opendata/t187ap04_O.csv",
+        "https://dts.twse.com.tw/opendata/t187ap04_P.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_L.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_O.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_P.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap04_L.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap04_O.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap04_P.csv",
@@ -655,6 +667,10 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     if not compact:
         return ""
     base = short_base_for_bond(record, company_short)
+    for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s]{2,24})", compact):
+        candidate = match.group(1).strip()
+        if candidate and not any(word in candidate for word in ("公司", "股票", "債券")):
+            return candidate
     for match in re.finditer(r"第([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
@@ -797,6 +813,18 @@ def clean_broker(value: str) -> str:
 def in_range(value: str, start: dt.date, end: dt.date) -> bool:
     parsed = parse_date(value)
     return bool(parsed and start <= parsed <= end)
+
+
+def unique_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for record in records:
+        key = record_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 def accepted_case(case_type: str) -> bool:
@@ -1967,7 +1995,9 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
         by_broker.setdefault(broker, {key: [] for key in OPENPYXL_SUMMARY_COLUMNS})
         name = record.get("顯示名稱") or record.get("公司名稱", "")
         by_broker[broker][code].append(name)
-    for record in new_records:
+    for record in year_records:
+        if not weekly_blue_columns(record, start, end):
+            continue
         broker = clean_broker(record.get("承銷商", "")) or "未填"
         code = record.get("分類", "其他")
         if code not in OPENPYXL_SUMMARY_COLUMNS:
@@ -2038,12 +2068,12 @@ def update_template_workbook_openpyxl(
     detail_sheet = find_openpyxl_detail_sheet(workbook, end)
     summary_sheet = find_openpyxl_summary_sheet(workbook, end)
 
-    existing_by_key: dict[str, int] = {}
+    existing_by_key: dict[str, tuple[int, dict[str, str]]] = {}
     for row_num in range(4, detail_sheet.max_row + 1):
         record = detail_row_record_from_sheet(detail_sheet, row_num)
         key = record_key(record)
         if key.strip("|"):
-            existing_by_key[key] = row_num
+            existing_by_key[key] = (row_num, record)
 
     last_row = last_detail_row(detail_sheet)
     template_row = max(4, last_row)
@@ -2051,7 +2081,11 @@ def update_template_workbook_openpyxl(
     for key, record in source_by_key.items():
         blue_cols = weekly_blue_columns(record, start, end)
         if key in existing_by_key:
-            update_existing_detail_row(detail_sheet, existing_by_key[key], record, blue_cols)
+            row_num, existing_record = existing_by_key[key]
+            if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
+                record = dict(record)
+                record["本次籌資計畫"] = existing_record["本次籌資計畫"]
+            update_existing_detail_row(detail_sheet, row_num, record, blue_cols)
             continue
         last_row += 1
         write_detail_row(detail_sheet, last_row, record, blue_cols, template_row)
@@ -2309,8 +2343,9 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
     amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
     stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
     effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
-    lookup_focus = {record_key(r) for r in new_records + effective_records}
-    purpose_focus = {record_key(r) for r in new_records}
+    weekly_records = unique_records(new_records + amend_records + stop_records + effective_records)
+    lookup_focus = {record_key(r) for r in weekly_records}
+    purpose_focus = {record_key(r) for r in weekly_records}
     lookup_warnings = enrich_records(records, end=end, focus_keys=lookup_focus, purpose_keys=purpose_focus)
     missing_purpose = [r for r in new_records if not r.get("本次籌資計畫", "").strip()]
 
