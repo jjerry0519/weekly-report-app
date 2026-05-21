@@ -390,33 +390,7 @@ def public_company_short_name(security_code: str) -> str:
                     return name
         except Exception:
             continue
-    searched = public_search_company_short_name(security_code)
-    if searched:
-        return searched
     return ""
-
-
-def public_search_company_short_name(security_code: str) -> str:
-    query = f"{security_code} 股票簡稱 公司簡稱 公開資訊觀測站"
-    url = f"https://s.jina.ai/{urllib.parse.quote(query)}"
-    try:
-        text = public_fetch_text(url, timeout=5)
-    except Exception:
-        return ""
-    compact = normalize_header(html_to_text(text))
-    candidates: list[str] = []
-    patterns = (
-        rf"(?:股票代號|證券代號|代號)[：:]?{re.escape(security_code)}(?:股票名稱|證券名稱|公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{{2,12}})",
-        rf"{re.escape(security_code)}[\u4e00-\u9fffA-Za-z0-9-]{{0,8}}(?:股票名稱|證券名稱|公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{{2,12}})",
-        rf"{re.escape(security_code)}[\\(（]?([\\u4e00-\\u9fffA-Za-z0-9-]{{2,12}})[\\)）]?",
-        r"(?:股票名稱|公司簡稱|證券簡稱|簡稱)[：:：]?([\u4e00-\u9fffA-Za-z0-9-]{2,12})",
-    )
-    for pattern in patterns:
-        for match in re.finditer(pattern, compact):
-            candidate = match.group(1).strip()
-            if is_plausible_security_short(candidate):
-                candidates.append(candidate)
-    return candidates[0] if candidates else ""
 
 
 def is_plausible_security_short(value: str) -> bool:
@@ -447,6 +421,35 @@ def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
                 except Exception:
                     continue
     return "\n".join(texts)
+
+
+def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
+    received = parse_date(record.get("收文日期", "")) or end
+    dates: list[dt.date] = []
+    for date_value in (received, end):
+        if date_value not in dates:
+            dates.append(date_value)
+    texts: list[str] = []
+    for date_value in dates:
+        params = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "1",
+            "TYPEK": "all",
+            "co_id": record.get("證券代號", ""),
+            "year": f"{roc_year(date_value):03d}",
+            "month": f"{date_value.month:02d}",
+        }
+        texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
+        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params))
+        if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
+            bond_params = dict(params)
+            bond_params["TYPEK"] = ""
+            bond_params["bond_kind"] = "5,7"
+            texts.append(mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), bond_params))
+    texts.append(mops_major_announcement_text(record, end))
+    texts.append(open_data_major_announcement_text(record))
+    return "\n".join(text for text in texts if text)
 
 
 def parse_bond_short_from_text(text: str, record: dict[str, str], company_short: str = "") -> str:
@@ -484,34 +487,11 @@ def parse_bond_short_from_text(text: str, record: dict[str, str], company_short:
 def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: str = "") -> str:
     if record.get("分類") not in ("CB", "ECB", "EB"):
         return ""
-    received = parse_date(record.get("收文日期", "")) or end
-    params = {
-        "encodeURIComponent": "1",
-        "step": "1",
-        "firstin": "1",
-        "TYPEK": "",
-        "bond_kind": "5,7",
-        "co_id": record.get("證券代號", ""),
-        "year": f"{roc_year(received):03d}",
-        "month": f"{received.month:02d}",
-    }
-    texts = [mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params)]
-    if received.month != end.month or received.year != end.year:
-        params_end = dict(params)
-        params_end["year"] = f"{roc_year(end):03d}"
-        params_end["month"] = f"{end.month:02d}"
-        texts.append(mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), params_end))
-    text = "\n".join(texts)
+    text = mops_official_lookup_text(record, end, include_bond=True)
     name = parse_bond_short_from_text(text, record, company_short)
     if name:
         return name
-    name = parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
-    if name:
-        return name
-    name = parse_bond_short_from_announcement(open_data_major_announcement_text(record), record, company_short)
-    if name:
-        return name
-    return parse_bond_short_from_announcement(public_search_text(record, end), record, company_short)
+    return parse_bond_short_from_announcement(text, record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -536,93 +516,6 @@ def parse_purpose_from_text(text: str) -> str:
 def funding_purpose_from_open_text(record: dict[str, str], text: str) -> str:
     matched = matching_record_text(text, record)
     return parse_purpose_from_text(matched)
-
-
-def public_search_text(record: dict[str, str], end: dt.date) -> str:
-    identity = " ".join(token for token in record_identity_tokens(record)[:3] if token)
-    amount = record.get("金額", "")
-    amount_text = amount_search_text(amount)
-    case_terms = " ".join(record_case_tokens(record))
-    company = record.get("公司名稱", "")
-    code = record.get("證券代號", "")
-    received = parse_date(record.get("收文日期", "")) or end
-    roc_ymd = compact_roc_date(received)
-    western_ymd = received.strftime("%Y%m%d")
-    queries = [
-        f"{code} {company} {roc_ymd} {amount_text} 董事會決議發行國內 轉換公司債",
-        f"{code} {company} {western_ymd} {amount_text} 國內第 轉換公司債",
-        f"{company} 董事會決議發行國內第 次 轉換公司債 計{amount_text}",
-        f"{code} {company} 國內第 轉換公司債 簡稱",
-        f"{code} {company} 債券簡稱 代碼 轉換公司債",
-        f"{company} 國內第 次 無擔保 有擔保 轉換公司債",
-        f"{company} 公告 本公司 國內第 轉換公司債",
-        f"{company} 代收價款 存儲專戶 轉換公司債",
-        f"{record.get('證券代號', '')} 債券簡稱 轉換公司債 代碼",
-        f"{identity} 國內 第 次 轉換公司債 債券簡稱",
-        f"{identity} {case_terms} {amount} 募得價款 用途 第幾次",
-        f"{identity} {roc_year(end):03d}{end.month:02d} {case_terms} 募得價款之用途",
-        f"{identity} 董事會 決議 辦理 發行 {case_terms}",
-    ]
-    texts: list[str] = []
-    texts.extend(search_result_snippets(record, queries))
-    for query in queries:
-        encoded = urllib.parse.urlencode({"q": query})
-        for url in (
-            f"https://s.jina.ai/{urllib.parse.quote(query)}",
-            f"https://www.bing.com/search?{encoded}",
-            f"https://duckduckgo.com/html/?{encoded}",
-        ):
-            try:
-                search_text = public_fetch_text(url, timeout=5)
-            except Exception:
-                continue
-            texts.append(search_text)
-            links: list[str] = []
-            raw_links = re.findall(r'href=["\'](https?://[^"\']+)["\']', search_text)
-            raw_links += re.findall(r'https?://[^\s<>"\')）]+', search_text)
-            for raw in raw_links:
-                link = html.unescape(raw)
-                if any(skip in link for skip in ("bing.com", "duckduckgo.com", "microsoft.com")):
-                    continue
-                if link not in links:
-                    links.append(link)
-                if len(links) >= 4:
-                    break
-            for link in links:
-                reader_url = "https://r.jina.ai/http://" + link.removeprefix("https://").removeprefix("http://")
-                for page_url in (link, reader_url):
-                    try:
-                        page_text = public_fetch_text(page_url, timeout=5)
-                    except Exception:
-                        continue
-                    if matching_record_text(page_text, record) or any(token in normalize_header(html_to_text(page_text)) for token in record_identity_tokens(record)):
-                        texts.append(page_text)
-                        break
-    return "\n".join(texts)
-
-
-def search_result_snippets(record: dict[str, str], queries: list[str]) -> list[str]:
-    snippets: list[str] = []
-    try:
-        import requests  # type: ignore[import-not-found]
-    except Exception:
-        return snippets
-    for query in queries[:4]:
-        try:
-            response = requests.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query},
-                headers={"User-Agent": "Mozilla/5.0"},
-                timeout=6,
-            )
-            text = response.text
-        except Exception:
-            continue
-        compact = normalize_header(html_to_text(text))
-        if not any(token in compact for token in record_identity_tokens(record)):
-            continue
-        snippets.append(text)
-    return snippets
 
 
 def amount_search_text(amount: str) -> str:
@@ -950,13 +843,13 @@ def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focu
     for group in groups.values():
         if all(is_bond_product_name(record.get("顯示名稱", "")) for record in group):
             continue
-        search_text = public_search_text(group[0], end)
-        explicit = parse_bond_short_from_announcement(search_text, group[0], public_company_short_name(group[0].get("證券代號", "")))
+        mops_text = mops_official_lookup_text(group[0], end, include_bond=True)
+        explicit = parse_bond_short_from_announcement(mops_text, group[0], public_company_short_name(group[0].get("證券代號", "")))
         missing = [record for record in group if not is_bond_product_name(record.get("顯示名稱", ""))]
         if len(group) == 1 and len(missing) == 1 and is_bond_product_name(explicit):
             missing[0]["顯示名稱"] = explicit
             continue
-        ordinals = bond_ordinals_from_text(search_text)
+        ordinals = bond_ordinals_from_text(mops_text)
         known_ordinals = [bond_product_ordinal(record.get("顯示名稱", "")) for record in group if is_bond_product_name(record.get("顯示名稱", ""))]
         for known in known_ordinals:
             if known and known not in ordinals:
@@ -1091,7 +984,7 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
     purpose = funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
     if purpose:
         return purpose
-    return funding_purpose_from_open_text(record, public_search_text(record, end))
+    return ""
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
