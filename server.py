@@ -541,10 +541,17 @@ def funding_purpose_from_open_text(record: dict[str, str], text: str) -> str:
 def public_search_text(record: dict[str, str], end: dt.date) -> str:
     identity = " ".join(token for token in record_identity_tokens(record)[:3] if token)
     amount = record.get("金額", "")
+    amount_text = amount_search_text(amount)
     case_terms = " ".join(record_case_tokens(record))
     company = record.get("公司名稱", "")
     code = record.get("證券代號", "")
+    received = parse_date(record.get("收文日期", "")) or end
+    roc_ymd = compact_roc_date(received)
+    western_ymd = received.strftime("%Y%m%d")
     queries = [
+        f"{code} {company} {roc_ymd} {amount_text} 董事會決議發行國內 轉換公司債",
+        f"{code} {company} {western_ymd} {amount_text} 國內第 轉換公司債",
+        f"{company} 董事會決議發行國內第 次 轉換公司債 計{amount_text}",
         f"{code} {company} 國內第 轉換公司債 簡稱",
         f"{code} {company} 債券簡稱 代碼 轉換公司債",
         f"{company} 國內第 次 無擔保 有擔保 轉換公司債",
@@ -570,7 +577,9 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
                 continue
             texts.append(search_text)
             links: list[str] = []
-            for raw in re.findall(r'href=["\'](https?://[^"\']+)["\']', search_text):
+            raw_links = re.findall(r'href=["\'](https?://[^"\']+)["\']', search_text)
+            raw_links += re.findall(r'https?://[^\s<>"\')）]+', search_text)
+            for raw in raw_links:
                 link = html.unescape(raw)
                 if any(skip in link for skip in ("bing.com", "duckduckgo.com", "microsoft.com")):
                     continue
@@ -579,13 +588,33 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
                 if len(links) >= 4:
                     break
             for link in links:
-                try:
-                    page_text = public_fetch_text(link, timeout=5)
-                except Exception:
-                    continue
-                if matching_record_text(page_text, record):
-                    texts.append(page_text)
+                reader_url = "https://r.jina.ai/http://" + link.removeprefix("https://").removeprefix("http://")
+                for page_url in (link, reader_url):
+                    try:
+                        page_text = public_fetch_text(page_url, timeout=5)
+                    except Exception:
+                        continue
+                    if matching_record_text(page_text, record) or any(token in normalize_header(html_to_text(page_text)) for token in record_identity_tokens(record)):
+                        texts.append(page_text)
+                        break
     return "\n".join(texts)
+
+
+def amount_search_text(amount: str) -> str:
+    digits = re.sub(r"\D", "", amount or "")
+    if not digits:
+        return ""
+    try:
+        value = int(digits)
+    except ValueError:
+        return digits
+    if value >= 100000000 and value % 100000000 == 0:
+        return f"{value // 100000000}億元"
+    if value >= 100000000:
+        return f"{value / 100000000:g}億元"
+    if value >= 10000 and value % 10000 == 0:
+        return f"{value // 10000}萬元"
+    return digits
 
 
 def open_data_major_announcement_text(record: dict[str, str]) -> str:
