@@ -564,6 +564,7 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
         f"{identity} 董事會 決議 辦理 發行 {case_terms}",
     ]
     texts: list[str] = []
+    texts.extend(search_result_snippets(record, queries))
     for query in queries:
         encoded = urllib.parse.urlencode({"q": query})
         for url in (
@@ -598,6 +599,30 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
                         texts.append(page_text)
                         break
     return "\n".join(texts)
+
+
+def search_result_snippets(record: dict[str, str], queries: list[str]) -> list[str]:
+    snippets: list[str] = []
+    try:
+        import requests  # type: ignore[import-not-found]
+    except Exception:
+        return snippets
+    for query in queries[:4]:
+        try:
+            response = requests.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=6,
+            )
+            text = response.text
+        except Exception:
+            continue
+        compact = normalize_header(html_to_text(text))
+        if not any(token in compact for token in record_identity_tokens(record)):
+            continue
+        snippets.append(text)
+    return snippets
 
 
 def amount_search_text(amount: str) -> str:
