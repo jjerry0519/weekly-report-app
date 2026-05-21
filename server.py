@@ -325,6 +325,23 @@ def html_to_text(value: str) -> str:
 
 
 def public_company_short_name(security_code: str) -> str:
+    for market in ("tse", "otc"):
+        url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{security_code}.tw&json=1&delay=0"
+        try:
+            data = json.loads(public_fetch_text(url, timeout=3))
+        except Exception:
+            continue
+        rows = data.get("msgArray") if isinstance(data, dict) else []
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("c") or "").strip() != security_code:
+                continue
+            name = str(row.get("n") or "").strip()
+            if name:
+                return name
     json_urls = (
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
         "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
@@ -373,7 +390,38 @@ def public_company_short_name(security_code: str) -> str:
                     return name
         except Exception:
             continue
+    searched = public_search_company_short_name(security_code)
+    if searched:
+        return searched
     return ""
+
+
+def public_search_company_short_name(security_code: str) -> str:
+    query = f"{security_code} 股票簡稱 公司簡稱"
+    url = f"https://s.jina.ai/{urllib.parse.quote(query)}"
+    try:
+        text = public_fetch_text(url, timeout=5)
+    except Exception:
+        return ""
+    compact = normalize_header(html_to_text(text))
+    candidates: list[str] = []
+    patterns = (
+        rf"{re.escape(security_code)}[\\(（]?([\\u4e00-\\u9fffA-Za-z0-9-]{{2,12}})[\\)）]?",
+        r"(?:股票名稱|公司簡稱|證券簡稱|簡稱)[：:：]?([\u4e00-\u9fffA-Za-z0-9-]{2,12})",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, compact):
+            candidate = match.group(1).strip()
+            if is_plausible_security_short(candidate):
+                candidates.append(candidate)
+    return candidates[0] if candidates else ""
+
+
+def is_plausible_security_short(value: str) -> bool:
+    if not value or len(value) > 12:
+        return False
+    bad_words = ("公司", "股價", "股票", "法人", "新聞", "即時", "基本", "財報", "營收", "董事")
+    return not any(word in value for word in bad_words)
 
 
 def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
@@ -420,8 +468,8 @@ def parse_bond_short_from_text(text: str, record: dict[str, str], company_short:
     if record.get("分類") == "ECB":
         overseas = [value for value in candidates if "海外" in value or "ECB" in value.upper()]
         if overseas:
-            return overseas[0]
-    return candidates[0] if candidates else ""
+            return normalize_bond_product_name(overseas[0], record)
+    return normalize_bond_product_name(candidates[0], record) if candidates else ""
 
 
 def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: str = "") -> str:
@@ -486,6 +534,8 @@ def public_search_text(record: dict[str, str], end: dt.date) -> str:
     amount = record.get("金額", "")
     case_terms = " ".join(record_case_tokens(record))
     queries = [
+        f"{record.get('證券代號', '')} 債券簡稱 轉換公司債 代碼",
+        f"{identity} 國內 第 次 轉換公司債 債券簡稱",
         f"{identity} {case_terms} {amount} 募得價款 用途 第幾次",
         f"{identity} {roc_year(end):03d}{end.month:02d} {case_terms} 募得價款之用途",
         f"{identity} 董事會 決議 辦理 發行 {case_terms}",
@@ -696,13 +746,59 @@ def chinese_ordinal_to_short(value: str) -> str:
     return text
 
 
-def short_base_for_bond(record: dict[str, str], company_short: str = "") -> str:
-    base = company_short or record.get("顯示名稱", "") or display_name_for_record(record) or record.get("公司名稱", "")
-    base = base.replace("F-", "").strip()
-    for suffix in ("國際科技", "電子股份有限公司", "股份有限公司"):
+def normalize_stock_short_for_bond(value: str) -> str:
+    base = normalize_header(value).replace("F-", "")
+    for suffix in ("股份有限公司", "有限公司", "公司"):
         if base.endswith(suffix) and len(base) > len(suffix) + 1:
             base = base[: -len(suffix)]
-    return base
+    if base.endswith("-KY"):
+        ky = "-KY"
+        base = base[:-3]
+    else:
+        ky = ""
+    suffix_rules = (
+        ("國際科技", ""),
+        ("國際", ""),
+        ("精密", ""),
+        ("電子", ""),
+        ("科技", "科"),
+    )
+    for suffix, replacement in suffix_rules:
+        if base.endswith(suffix) and len(base) > len(suffix) + 1:
+            base = base[: -len(suffix)] + replacement
+            break
+    return base + ky
+
+
+def bond_name_with_ordinal(base: str, ordinal: str, record: dict[str, str]) -> str:
+    stock = normalize_stock_short_for_bond(base)
+    if not stock:
+        return ""
+    prefix = "海外" if record.get("分類") == "ECB" and "海外" not in ordinal else ""
+    if stock.endswith("-KY"):
+        return f"{stock[:-3]}{prefix}{ordinal}-KY"
+    return f"{stock}{prefix}{ordinal}"
+
+
+def normalize_bond_product_name(value: str, record: dict[str, str]) -> str:
+    text = normalize_header(value).replace("F-", "")
+    if not text:
+        return ""
+    match = re.match(r"(.+?)(海外)?([一二三四五六七八九十百\d]+)(-KY)?$", text)
+    if match:
+        base = match.group(1)
+        overseas = match.group(2) or ""
+        ordinal = chinese_ordinal_to_short(match.group(3))
+        suffix = match.group(4) or ""
+        if suffix and not base.endswith("-KY"):
+            base += "-KY"
+        return bond_name_with_ordinal(base, overseas + ordinal, record)
+    return text
+
+
+def short_base_for_bond(record: dict[str, str], company_short: str = "") -> str:
+    base = company_short or record.get("顯示名稱", "") or display_name_for_record(record) or record.get("公司名稱", "")
+    return normalize_stock_short_for_bond(base)
 
 
 def parse_bond_short_from_announcement(text: str, record: dict[str, str], company_short: str = "") -> str:
@@ -711,14 +807,22 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     if not compact:
         return ""
     base = short_base_for_bond(record, company_short)
-    for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s]{2,24})", compact):
+    for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s()（）]{2,24})", compact):
         candidate = match.group(1).strip()
         if candidate and not any(word in candidate for word in ("公司", "股票", "債券")):
-            return candidate
-    for match in re.finditer(r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
+            return normalize_bond_product_name(candidate, record)
+    bond_pattern = r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,80}?(?:(?:有|無)?擔保)?(?:可)?(?:轉換|交換)公司債"
+    for match in re.finditer(rf"([\u4e00-\u9fffA-Za-z0-9-]{{2,40}}?)(?:股份有限公司)?{bond_pattern}", compact):
+        base_candidate = company_short or match.group(1)
+        base_candidate = re.split(r"[：:，,。；;]", base_candidate)[-1]
+        ordinal = chinese_ordinal_to_short(match.group(2))
+        name = bond_name_with_ordinal(base_candidate, ordinal, record)
+        if name:
+            return name
+    for match in re.finditer(bond_pattern, compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
-            return f"{base}{ordinal}"
+            return bond_name_with_ordinal(base, ordinal, record)
     return ""
 
 
