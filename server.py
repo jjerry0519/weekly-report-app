@@ -1854,13 +1854,13 @@ HTML = """<!doctype html>
     </section>
     <section>
       <h2>手動上傳來源檔</h2>
-      <p class="hint">請上傳你每週下載好的「申報案件彙總表」。若已有上週產出的同業送件明細，請一起上傳當基準檔；系統會保留舊資料，只有截止日前 7 天（含截止日）的新增或變動資料標藍。</p>
+      <p class="hint">請上傳上週產出的「同業送件明細」當基準檔，再上傳你每週下載好的「申報案件彙總表」。系統會保留舊資料，只有截止日前 7 天（含截止日）的新增或變動資料標藍。</p>
       <div class="controls">
-        <label>上週同業送件明細（選填）
-          <input id="baseFile" name="base" form="uploadForm" type="file" accept=".xlsx,.xls">
+        <label>上週同業送件明細
+          <input id="baseFile" name="base" form="uploadForm" type="file" accept=".xlsx,.xls" required>
         </label>
         <label>證期局年度申報案件 Excel
-          <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls">
+          <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls" required>
         </label>
         <button id="uploadBtn" form="uploadForm" type="submit">用上傳檔產出</button>
       </div>
@@ -1945,7 +1945,12 @@ HTML = """<!doctype html>
 
     async function handleUpload(event) {
       if (event) event.preventDefault();
+      const base = baseFile.files[0];
       const file = sourceFile.files[0];
+      if (!base) {
+        setStatus("請先選擇上週產出的同業送件明細，否則資料無法連續累積。", true);
+        return;
+      }
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
         return;
@@ -1956,7 +1961,7 @@ HTML = """<!doctype html>
         setStatus("正在用上傳檔產出 Excel...");
         try {
           const form = new FormData();
-          if (baseFile.files[0]) form.append("base", baseFile.files[0]);
+          form.append("base", base);
           form.append("source", file);
           const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
           const responseText = await res.text();
@@ -2091,6 +2096,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             query = urllib.parse.parse_qs(parsed.query)
             source_path, base_path, fields = self.save_uploaded_xlsx()
+            if base_path is None:
+                raise ValueError("請上傳上週產出的同業送件明細，否則資料無法連續累積。")
             end_text = query.get("end", [""])[0] or fields.get("end", "")
             end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
             start, end = report_window(end)
