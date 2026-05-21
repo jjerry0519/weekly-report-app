@@ -426,6 +426,13 @@ def is_plausible_security_short(value: str) -> bool:
     return not any(word in value for word in bad_words)
 
 
+def stock_display_name(record: dict[str, str]) -> str:
+    short_name = public_company_short_name(record.get("證券代號", ""))
+    if short_name:
+        return normalize_stock_short_for_bond(short_name)
+    return normalize_stock_short_for_bond(display_name_for_record(record) or record.get("公司名稱", ""))
+
+
 def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
     hosts = ("https://mopsov.twse.com.tw", "https://mops.twse.com.tw")
     texts: list[str] = []
@@ -798,6 +805,7 @@ def normalize_stock_short_for_bond(value: str) -> str:
         ("國際科技", ""),
         ("國際", ""),
         ("精密", ""),
+        ("精機", ""),
         ("電子", ""),
         ("達科技", "達科"),
         ("科技", ""),
@@ -903,6 +911,17 @@ def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focu
         company_short = public_company_short_name(group[0].get("證券代號", "")) or group[0].get("顯示名稱", "") or group[0].get("公司名稱", "")
         for record, ordinal in zip(group, ordinals):
             record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
+
+
+def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
+    for record in records:
+        if focus_keys is not None and record_key(record) not in focus_keys:
+            continue
+        if record.get("分類") in ("CB", "ECB", "EB"):
+            if is_bond_product_name(record.get("顯示名稱", "")):
+                continue
+        else:
+            record["顯示名稱"] = stock_display_name(record)
 
 
 def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
@@ -1063,11 +1082,11 @@ def enrich_records(
         is_focus = focus_keys is None or record_key(record) in focus_keys
         wants_fresh_purpose = purpose_keys is None or record_key(record) in purpose_keys
         if is_focus:
-            record["顯示名稱"] = display_name_for_record(record)
+            record["顯示名稱"] = normalize_stock_short_for_bond(display_name_for_record(record))
             if wants_fresh_purpose:
                 record["本次籌資計畫"] = ""
         elif not data:
-            record["顯示名稱"] = display_name_for_record(record)
+            record["顯示名稱"] = normalize_stock_short_for_bond(display_name_for_record(record))
         else:
             record["顯示名稱"] = data["display"]
             record["本次籌資計畫"] = data["purpose"]
@@ -1078,13 +1097,17 @@ def enrich_records(
         need_purpose = wants_fresh_purpose
         if not ENABLE_ONLINE_MOPS_LOOKUP:
             warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：線上查詢未啟用；本工具要求線上查詢，請開啟 ENABLE_ONLINE_MOPS_LOOKUP。")
+            if not need_bond_name:
+                record["顯示名稱"] = normalize_stock_short_for_bond(display_name_for_record(record))
             if need_bond_name:
-                record["顯示名稱"] = missing_bond_display_name(record)
+                record["顯示名稱"] = bond_name_with_ordinal(stock_display_name(record), "一", record)
                 warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未查詢 MOPS 第幾次名稱，請勿直接採用備援名稱。")
             if need_purpose:
                 warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未查詢 MOPS 本次籌資計畫，已留白避免查錯。")
             continue
         lookup_jobs.append((record, key, need_company_short, need_bond_name, need_purpose))
+    if not ENABLE_ONLINE_MOPS_LOOKUP:
+        normalize_weekly_stock_names(records, focus_keys)
     if ENABLE_ONLINE_MOPS_LOOKUP and lookup_jobs:
         workers = max(1, min(MAX_MOPS_WORKERS, len(lookup_jobs)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -1116,6 +1139,7 @@ def enrich_records(
                     else:
                         warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 找不到可精準比對的本次籌資計畫，已留白避免查錯，請人工確認。")
         resolve_missing_bond_names(records, end, focus_keys, warnings)
+        normalize_weekly_stock_names(records, focus_keys)
     return warnings
 
 
@@ -2289,9 +2313,11 @@ def weekly_blue_columns(record: dict[str, str], start: dt.date, end: dt.date) ->
 
 
 def detail_field_value(record: dict[str, str], field: str) -> str:
-    if field == "公司名稱" and record.get("分類") in ("CB", "ECB", "EB"):
+    if field == "公司名稱":
         display = record.get("顯示名稱", "")
-        if is_bond_product_name(display) or display.startswith("MOPS待確認："):
+        if record.get("分類") in ("CB", "ECB", "EB") and is_bond_product_name(display):
+            return display
+        if record.get("分類") not in ("CB", "ECB", "EB") and display:
             return display
     return record.get(field, "")
 
