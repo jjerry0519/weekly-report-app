@@ -909,8 +909,12 @@ def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focu
                 ordinals.append(known)
         ordinals = complete_ordinals(ordinals, len(group))
         company_short = public_company_short_name(group[0].get("證券代號", "")) or group[0].get("顯示名稱", "") or group[0].get("公司名稱", "")
-        for record, ordinal in zip(group, ordinals):
-            record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
+        if ordinals:
+            for record, ordinal in zip(group, ordinals):
+                record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
+        else:
+            for record in group:
+                record["顯示名稱"] = stock_display_name(record)
 
 
 def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
@@ -932,6 +936,8 @@ def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
             cleaned.append(value)
     if len(cleaned) >= count:
         return cleaned[:count]
+    if not cleaned:
+        return []
     numbers = [ordinal_to_int(value) for value in cleaned]
     numbers = [number for number in numbers if number is not None]
     start = min(numbers) if numbers else 1
@@ -1100,7 +1106,7 @@ def enrich_records(
             if not need_bond_name:
                 record["顯示名稱"] = normalize_stock_short_for_bond(display_name_for_record(record))
             if need_bond_name:
-                record["顯示名稱"] = bond_name_with_ordinal(stock_display_name(record), "一", record)
+                record["顯示名稱"] = stock_display_name(record)
                 warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：未查詢 MOPS 第幾次名稱，請勿直接採用備援名稱。")
             if need_purpose:
                 warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：未查詢 MOPS 本次籌資計畫，已留白避免查錯。")
