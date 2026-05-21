@@ -22,6 +22,8 @@ from pathlib import Path
 from xml.etree import ElementTree as ET
 
 from openpyxl import load_workbook
+from openpyxl.cell.rich_text import CellRichText, TextBlock
+from openpyxl.cell.text import InlineFont
 from openpyxl.styles import Font
 
 
@@ -329,6 +331,12 @@ def public_company_short_name(security_code: str) -> str:
         "https://www.tpex.org.tw/openapi/v1/t187ap03_O",
     )
     csv_urls = (
+        "https://dts.twse.com.tw/opendata/t187ap03_L.csv",
+        "https://dts.twse.com.tw/opendata/t187ap03_O.csv",
+        "https://dts.twse.com.tw/opendata/t187ap03_P.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_L.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_O.csv",
+        "http://dts.twse.com.tw/opendata/t187ap03_P.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap03_P.csv",
@@ -440,7 +448,10 @@ def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: st
     name = parse_bond_short_from_text(text, record, company_short)
     if name:
         return name
-    return parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
+    name = parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
+    if name:
+        return name
+    return parse_bond_short_from_announcement(open_data_major_announcement_text(record), record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -460,6 +471,55 @@ def parse_purpose_from_text(text: str) -> str:
         if any(keyword in compact for keyword in keywords):
             purposes.append(label)
     return "；".join(dict.fromkeys(purposes))
+
+
+def funding_purpose_from_open_text(record: dict[str, str], text: str) -> str:
+    matched = matching_record_text(text, record)
+    return parse_purpose_from_text(matched)
+
+
+def open_data_major_announcement_text(record: dict[str, str]) -> str:
+    urls = (
+        "https://openapi.twse.com.tw/v1/opendata/t187ap04_L",
+        "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap04_O",
+        "https://www.tpex.org.tw/openapi/v1/t187ap04_O",
+        "https://dts.twse.com.tw/opendata/t187ap04_L.csv",
+        "https://dts.twse.com.tw/opendata/t187ap04_O.csv",
+        "https://dts.twse.com.tw/opendata/t187ap04_P.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_L.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_O.csv",
+        "http://dts.twse.com.tw/opendata/t187ap04_P.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_L.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_O.csv",
+        "https://mopsfin.twse.com.tw/opendata/t187ap04_P.csv",
+    )
+    security_code = record.get("證券代號", "")
+    texts: list[str] = []
+    for url in urls:
+        try:
+            raw = public_fetch_text(url, timeout=3)
+        except Exception:
+            continue
+        if not raw.strip():
+            continue
+        rows: list[dict[str, str]] = []
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                rows = [row for row in data if isinstance(row, dict)]
+        except Exception:
+            try:
+                rows = list(csv.DictReader(io.StringIO(raw)))
+            except Exception:
+                rows = []
+        for row in rows:
+            code = str(row.get("公司代號") or row.get("證券代號") or row.get("公司代號/股票代號") or row.get("Code") or "").strip()
+            if code and code != security_code:
+                continue
+            joined = " ".join(str(value) for value in row.values() if value is not None)
+            if security_code in joined or any(token in normalize_header(joined) for token in record_identity_tokens(record)):
+                texts.append(joined)
+    return "\n".join(texts)
 
 
 def text_matches_record(text: str, record: dict[str, str]) -> bool:
@@ -560,17 +620,26 @@ def mops_major_announcement_text(record: dict[str, str], end: dt.date) -> str:
         dates.append(end)
     texts: list[str] = []
     for date in dates:
+        typek = "sii" if "上市" in record.get("公司型態", "") else ("otc" if "上櫃" in record.get("公司型態", "") else "all")
         params = {
             "encodeURIComponent": "1",
             "step": "1",
             "firstin": "1",
             "off": "1",
-            "TYPEK": "all",
+            "queryName": "COMPANY_ID",
+            "inpuType": "co_id",
+            "TYPEK": typek,
             "co_id": record.get("證券代號", ""),
             "year": f"{roc_year(date):03d}",
             "month": f"{date.month:02d}",
+            "b_date": "1",
+            "e_date": "31",
         }
         texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01", "/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
+        if typek != "all":
+            params_all = dict(params)
+            params_all["TYPEK"] = "all"
+            texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params_all))
     return "\n".join(texts)
 
 
@@ -598,6 +667,10 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     if not compact:
         return ""
     base = short_base_for_bond(record, company_short)
+    for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s]{2,24})", compact):
+        candidate = match.group(1).strip()
+        if candidate and not any(word in candidate for word in ("公司", "股票", "債券")):
+            return candidate
     for match in re.finditer(r"第([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
@@ -626,7 +699,10 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
     purpose = parse_purpose_from_text(matching_record_text(text, record))
     if purpose:
         return purpose
-    return parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
+    purpose = parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
+    if purpose:
+        return purpose
+    return funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -737,6 +813,18 @@ def clean_broker(value: str) -> str:
 def in_range(value: str, start: dt.date, end: dt.date) -> bool:
     parsed = parse_date(value)
     return bool(parsed and start <= parsed <= end)
+
+
+def unique_records(records: list[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    unique: list[dict[str, str]] = []
+    for record in records:
+        key = record_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(record)
+    return unique
 
 
 def accepted_case(case_type: str) -> bool:
@@ -1907,7 +1995,9 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
         by_broker.setdefault(broker, {key: [] for key in OPENPYXL_SUMMARY_COLUMNS})
         name = record.get("顯示名稱") or record.get("公司名稱", "")
         by_broker[broker][code].append(name)
-    for record in new_records:
+    for record in year_records:
+        if not weekly_blue_columns(record, start, end):
+            continue
         broker = clean_broker(record.get("承銷商", "")) or "未填"
         code = record.get("分類", "其他")
         if code not in OPENPYXL_SUMMARY_COLUMNS:
@@ -1926,10 +2016,8 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
             names = [name for name in code_map.get(code, []) if name]
             weekly_names = set(weekly_by_broker.get(broker, {}).get(code, []))
             cell = sheet.cell(row_num, col_idx)
-            cell.value = "、".join(names)
+            cell.value = summary_rich_text(names, weekly_names)
             black_cell(cell)
-            if weekly_names and all(name in weekly_names for name in names):
-                blue_cell(cell)
 
     if "合計" in broker_rows:
         row_num = broker_rows["合計"]
@@ -1940,6 +2028,23 @@ def update_summary_sheet_openpyxl(sheet: object, base_records: list[dict[str, st
         sheet.cell(row_num, 50).value = sum(totals.values())
         for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
             sheet.cell(row_num, col_idx).value = totals[code]
+
+
+def summary_rich_text(names: list[str], weekly_names: set[str]) -> object:
+    if not names:
+        return ""
+    if not weekly_names:
+        return "、".join(names)
+    parts: list[object] = []
+    blue_font = InlineFont(color=BLUE_RGB)
+    for index, name in enumerate(names):
+        prefix = "、" if index else ""
+        text = prefix + name
+        if name in weekly_names:
+            parts.append(TextBlock(blue_font, text))
+        else:
+            parts.append(text)
+    return CellRichText(*parts)
 
 
 def update_template_workbook_openpyxl(
@@ -1963,12 +2068,12 @@ def update_template_workbook_openpyxl(
     detail_sheet = find_openpyxl_detail_sheet(workbook, end)
     summary_sheet = find_openpyxl_summary_sheet(workbook, end)
 
-    existing_by_key: dict[str, int] = {}
+    existing_by_key: dict[str, tuple[int, dict[str, str]]] = {}
     for row_num in range(4, detail_sheet.max_row + 1):
         record = detail_row_record_from_sheet(detail_sheet, row_num)
         key = record_key(record)
         if key.strip("|"):
-            existing_by_key[key] = row_num
+            existing_by_key[key] = (row_num, record)
 
     last_row = last_detail_row(detail_sheet)
     template_row = max(4, last_row)
@@ -1976,7 +2081,11 @@ def update_template_workbook_openpyxl(
     for key, record in source_by_key.items():
         blue_cols = weekly_blue_columns(record, start, end)
         if key in existing_by_key:
-            update_existing_detail_row(detail_sheet, existing_by_key[key], record, blue_cols)
+            row_num, existing_record = existing_by_key[key]
+            if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
+                record = dict(record)
+                record["本次籌資計畫"] = existing_record["本次籌資計畫"]
+            update_existing_detail_row(detail_sheet, row_num, record, blue_cols)
             continue
         last_row += 1
         write_detail_row(detail_sheet, last_row, record, blue_cols, template_row)
@@ -2234,8 +2343,9 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
     amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
     stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
     effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
-    lookup_focus = {record_key(r) for r in new_records + effective_records}
-    purpose_focus = {record_key(r) for r in new_records}
+    weekly_records = unique_records(new_records + amend_records + stop_records + effective_records)
+    lookup_focus = {record_key(r) for r in weekly_records}
+    purpose_focus = {record_key(r) for r in weekly_records}
     lookup_warnings = enrich_records(records, end=end, focus_keys=lookup_focus, purpose_keys=purpose_focus)
     missing_purpose = [r for r in new_records if not r.get("本次籌資計畫", "").strip()]
 
