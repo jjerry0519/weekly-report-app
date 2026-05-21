@@ -451,7 +451,10 @@ def mops_bond_short_name(record: dict[str, str], end: dt.date, company_short: st
     name = parse_bond_short_from_announcement(mops_major_announcement_text(record, end), record, company_short)
     if name:
         return name
-    return parse_bond_short_from_announcement(open_data_major_announcement_text(record), record, company_short)
+    name = parse_bond_short_from_announcement(open_data_major_announcement_text(record), record, company_short)
+    if name:
+        return name
+    return parse_bond_short_from_announcement(public_search_text(record, end), record, company_short)
 
 
 def parse_purpose_from_text(text: str) -> str:
@@ -476,6 +479,47 @@ def parse_purpose_from_text(text: str) -> str:
 def funding_purpose_from_open_text(record: dict[str, str], text: str) -> str:
     matched = matching_record_text(text, record)
     return parse_purpose_from_text(matched)
+
+
+def public_search_text(record: dict[str, str], end: dt.date) -> str:
+    identity = " ".join(token for token in record_identity_tokens(record)[:3] if token)
+    amount = record.get("金額", "")
+    case_terms = " ".join(record_case_tokens(record))
+    queries = [
+        f"{identity} {case_terms} {amount} 募得價款 用途 第幾次",
+        f"{identity} {roc_year(end):03d}{end.month:02d} {case_terms} 募得價款之用途",
+        f"{identity} 董事會 決議 辦理 發行 {case_terms}",
+    ]
+    texts: list[str] = []
+    for query in queries:
+        encoded = urllib.parse.urlencode({"q": query})
+        for url in (
+            f"https://s.jina.ai/{urllib.parse.quote(query)}",
+            f"https://www.bing.com/search?{encoded}",
+            f"https://duckduckgo.com/html/?{encoded}",
+        ):
+            try:
+                search_text = public_fetch_text(url, timeout=5)
+            except Exception:
+                continue
+            texts.append(search_text)
+            links: list[str] = []
+            for raw in re.findall(r'href=["\'](https?://[^"\']+)["\']', search_text):
+                link = html.unescape(raw)
+                if any(skip in link for skip in ("bing.com", "duckduckgo.com", "microsoft.com")):
+                    continue
+                if link not in links:
+                    links.append(link)
+                if len(links) >= 4:
+                    break
+            for link in links:
+                try:
+                    page_text = public_fetch_text(link, timeout=5)
+                except Exception:
+                    continue
+                if matching_record_text(page_text, record):
+                    texts.append(page_text)
+    return "\n".join(texts)
 
 
 def open_data_major_announcement_text(record: dict[str, str]) -> str:
@@ -671,7 +715,7 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
         candidate = match.group(1).strip()
         if candidate and not any(word in candidate for word in ("公司", "股票", "債券")):
             return candidate
-    for match in re.finditer(r"第([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
+    for match in re.finditer(r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]*?(?:有|無)擔保(?:轉換|交換)公司債", compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
             return f"{base}{ordinal}"
@@ -702,7 +746,10 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
     purpose = parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
     if purpose:
         return purpose
-    return funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
+    purpose = funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
+    if purpose:
+        return purpose
+    return funding_purpose_from_open_text(record, public_search_text(record, end))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
