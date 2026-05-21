@@ -3022,7 +3022,7 @@ HTML = """<!doctype html>
         ["本週生效", counts.effective],
         ["補正 / 停止", `${counts.amend} / ${counts.stop}`],
         ["待補原因", counts.missingPurpose || 0],
-        ["MOPS待確認", counts.lookupWarnings || 0],
+        ["查詢未完成", counts.lookupWarnings || 0],
       ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
     }
 
