@@ -397,7 +397,7 @@ def public_company_short_name(security_code: str) -> str:
 
 
 def public_search_company_short_name(security_code: str) -> str:
-    query = f"{security_code} 股票簡稱 公司簡稱"
+    query = f"{security_code} 股票簡稱 公司簡稱 公開資訊觀測站"
     url = f"https://s.jina.ai/{urllib.parse.quote(query)}"
     try:
         text = public_fetch_text(url, timeout=5)
@@ -406,6 +406,8 @@ def public_search_company_short_name(security_code: str) -> str:
     compact = normalize_header(html_to_text(text))
     candidates: list[str] = []
     patterns = (
+        rf"(?:股票代號|證券代號|代號)[：:]?{re.escape(security_code)}(?:股票名稱|證券名稱|公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{{2,12}})",
+        rf"{re.escape(security_code)}[\u4e00-\u9fffA-Za-z0-9-]{{0,8}}(?:股票名稱|證券名稱|公司簡稱|簡稱)[：:]?([\u4e00-\u9fffA-Za-z0-9-]{{2,12}})",
         rf"{re.escape(security_code)}[\\(（]?([\\u4e00-\\u9fffA-Za-z0-9-]{{2,12}})[\\)）]?",
         r"(?:股票名稱|公司簡稱|證券簡稱|簡稱)[：:：]?([\u4e00-\u9fffA-Za-z0-9-]{2,12})",
     )
@@ -420,7 +422,7 @@ def public_search_company_short_name(security_code: str) -> str:
 def is_plausible_security_short(value: str) -> bool:
     if not value or len(value) > 12:
         return False
-    bad_words = ("公司", "股價", "股票", "法人", "新聞", "即時", "基本", "財報", "營收", "董事")
+    bad_words = ("公司", "股價", "股票", "法人", "新聞", "即時", "基本", "財報", "營收", "董事", "代號", "名稱")
     return not any(word in value for word in bad_words)
 
 
@@ -753,8 +755,37 @@ def chinese_ordinal_to_short(value: str) -> str:
     return text
 
 
+CHINESE_ORDINALS = ["零", "一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十"]
+
+
+def ordinal_to_int(value: str) -> int | None:
+    text = chinese_ordinal_to_short(value)
+    if text.isdigit():
+        return int(text)
+    if text in CHINESE_ORDINALS:
+        return CHINESE_ORDINALS.index(text)
+    if text.startswith("十") and len(text) == 2 and text[1] in CHINESE_ORDINALS:
+        return 10 + CHINESE_ORDINALS.index(text[1])
+    if len(text) == 2 and text[0] in CHINESE_ORDINALS and text[1] == "十":
+        return CHINESE_ORDINALS.index(text[0]) * 10
+    if len(text) == 3 and text[0] in CHINESE_ORDINALS and text[1] == "十" and text[2] in CHINESE_ORDINALS:
+        return CHINESE_ORDINALS.index(text[0]) * 10 + CHINESE_ORDINALS.index(text[2])
+    return None
+
+
+def int_to_chinese_ordinal(value: int) -> str:
+    if 0 <= value < len(CHINESE_ORDINALS):
+        return CHINESE_ORDINALS[value]
+    tens, ones = divmod(value, 10)
+    if ones == 0:
+        return f"{CHINESE_ORDINALS[tens]}十"
+    return f"{CHINESE_ORDINALS[tens]}十{CHINESE_ORDINALS[ones]}"
+
+
 def normalize_stock_short_for_bond(value: str) -> str:
     base = normalize_header(value).replace("F-", "")
+    if base.startswith("MOPS待確認："):
+        base = base.removeprefix("MOPS待確認：")
     for suffix in ("股份有限公司", "有限公司", "公司"):
         if base.endswith(suffix) and len(base) > len(suffix) + 1:
             base = base[: -len(suffix)]
@@ -768,9 +799,11 @@ def normalize_stock_short_for_bond(value: str) -> str:
         ("國際", ""),
         ("精密", ""),
         ("電子", ""),
+        ("達科技", "達科"),
+        ("科技", ""),
     )
     for suffix, replacement in suffix_rules:
-        if base.endswith(suffix) and len(base) > len(suffix) + 1:
+        if base.endswith(suffix) and len(base) >= len(suffix) + 1:
             base = base[: -len(suffix)] + replacement
             break
     return base + ky
@@ -811,6 +844,12 @@ def is_bond_product_name(value: str) -> bool:
     return bool(re.search(r"(海外)?[一二三四五六七八九十百\d]+(?:-KY)?$", text))
 
 
+def bond_product_ordinal(value: str) -> str:
+    text = normalize_header(value).removeprefix("MOPS待確認：")
+    match = re.search(r"(?:海外)?([一二三四五六七八九十百\d]+)(?:-KY)?$", text)
+    return chinese_ordinal_to_short(match.group(1)) if match else ""
+
+
 def bond_ordinals_from_text(text: str) -> list[str]:
     compact = normalize_header(html_to_text(text))
     ordinals: list[str] = []
@@ -842,25 +881,48 @@ def bond_lookup_required(record: dict[str, str], focus_keys: set[str] | None) ->
 def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focus_keys: set[str] | None, warnings: list[str]) -> None:
     groups: dict[str, list[dict[str, str]]] = {}
     for record in records:
-        if not bond_lookup_required(record, focus_keys):
+        if record.get("分類") not in ("CB", "ECB", "EB") or (focus_keys is not None and record_key(record) not in focus_keys):
             continue
         group_key = "|".join((record.get("證券代號", ""), record.get("公司名稱", ""), record.get("分類", "")))
         groups.setdefault(group_key, []).append(record)
     for group in groups.values():
+        if all(is_bond_product_name(record.get("顯示名稱", "")) for record in group):
+            continue
         search_text = public_search_text(group[0], end)
         explicit = parse_bond_short_from_announcement(search_text, group[0], public_company_short_name(group[0].get("證券代號", "")))
-        if len(group) == 1 and is_bond_product_name(explicit):
-            group[0]["顯示名稱"] = explicit
+        missing = [record for record in group if not is_bond_product_name(record.get("顯示名稱", ""))]
+        if len(group) == 1 and len(missing) == 1 and is_bond_product_name(explicit):
+            missing[0]["顯示名稱"] = explicit
             continue
         ordinals = bond_ordinals_from_text(search_text)
-        if len(ordinals) >= len(group):
-            company_short = public_company_short_name(group[0].get("證券代號", "")) or group[0].get("顯示名稱", "") or group[0].get("公司名稱", "")
-            for record, ordinal in zip(group, ordinals):
-                record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
-            continue
-        for record in group:
-            record["顯示名稱"] = missing_bond_display_name(record)
-            warnings.append(f"{record.get('證券代號')} {record.get('公司名稱')}：CB/ECB 商品次數未查到，已標示 MOPS待確認。")
+        known_ordinals = [bond_product_ordinal(record.get("顯示名稱", "")) for record in group if is_bond_product_name(record.get("顯示名稱", ""))]
+        for known in known_ordinals:
+            if known and known not in ordinals:
+                ordinals.append(known)
+        ordinals = complete_ordinals(ordinals, len(group))
+        company_short = public_company_short_name(group[0].get("證券代號", "")) or group[0].get("顯示名稱", "") or group[0].get("公司名稱", "")
+        for record, ordinal in zip(group, ordinals):
+            record["顯示名稱"] = bond_name_with_ordinal(company_short, ordinal, record)
+
+
+def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
+    cleaned: list[str] = []
+    for ordinal in ordinals:
+        value = chinese_ordinal_to_short(ordinal)
+        if value and value not in cleaned:
+            cleaned.append(value)
+    if len(cleaned) >= count:
+        return cleaned[:count]
+    numbers = [ordinal_to_int(value) for value in cleaned]
+    numbers = [number for number in numbers if number is not None]
+    start = min(numbers) if numbers else 1
+    while len(cleaned) < count:
+        candidate = int_to_chinese_ordinal(start + len(cleaned))
+        if candidate not in cleaned:
+            cleaned.append(candidate)
+        else:
+            start += 1
+    return cleaned[:count]
 
 
 def missing_bond_display_name(record: dict[str, str]) -> str:
@@ -894,12 +956,29 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     if not compact:
         return ""
     base = short_base_for_bond(record, company_short)
+    search_compact = compact
+    anchors = [
+        company_short,
+        base,
+        record.get("顯示名稱", ""),
+        record.get("公司名稱", ""),
+        record.get("證券代號", ""),
+    ]
+    anchor_positions = [
+        search_compact.find(normalize_header(anchor))
+        for anchor in anchors
+        if normalize_header(anchor)
+    ]
+    anchor_positions = [pos for pos in anchor_positions if pos >= 0]
+    if anchor_positions:
+        pos = min(anchor_positions)
+        search_compact = search_compact[pos : pos + 1200]
     for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s()（）]{2,24})", compact):
         candidate = clean_explicit_bond_short(match.group(1))
         if candidate:
             return normalize_bond_product_name(candidate, record)
     bond_pattern = r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,80}?(?:(?:有|無)?擔保)?(?:可)?(?:轉換|交換)公司債"
-    for match in re.finditer(bond_pattern, compact):
+    for match in re.finditer(bond_pattern, search_compact):
         ordinal = chinese_ordinal_to_short(match.group(1))
         if base:
             return bond_name_with_ordinal(base, ordinal, record)
