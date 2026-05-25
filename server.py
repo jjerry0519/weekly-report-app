@@ -487,6 +487,43 @@ def mops_follow_detail_links(text: str) -> str:
     return "\n".join(detail_texts)
 
 
+def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keyword: str) -> str:
+    market_kinds = ["C"]
+    if "上市" in record.get("公司型態", ""):
+        market_kinds.insert(0, "L")
+    elif "上櫃" in record.get("公司型態", ""):
+        market_kinds.insert(0, "O")
+    texts: list[str] = []
+    for kind in dict.fromkeys(market_kinds):
+        params = {
+            "encodeURIComponent": "1",
+            "step": "1",
+            "firstin": "true",
+            "id": "",
+            "key": "",
+            "TYPEK": "",
+            "Stp": "4",
+            "go": "false",
+            "co_id": record.get("證券代號", ""),
+            "COMPANY_ID": record.get("證券代號", ""),
+            "r1": "1",
+            "KIND": kind,
+            "CODE": "",
+            "keyWord": keyword,
+            "Condition2": "2",
+            "keyWord2": "",
+            "year": f"{roc_year(date_value):03d}",
+            "month1": str(date_value.month),
+            "begin_day": "1",
+            "end_day": "31",
+            "Orderby": "1",
+        }
+        query_text = mops_query_text(("/mops/web/ajax_t51sb10", "/mops/web/t51sb10"), params)
+        texts.append(query_text)
+        texts.append(mops_follow_detail_links(query_text))
+    return "\n".join(texts)
+
+
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     dates: list[dt.date] = []
@@ -515,6 +552,11 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
         keyword_text = mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params)
         texts.append(keyword_text)
         texts.append(mops_follow_detail_links(keyword_text))
+        if record.get("分類") in ("CB", "ECB", "EB"):
+            texts.append(mops_subject_search_text(record, date_value, "轉換公司債"))
+            texts.append(mops_subject_search_text(record, date_value, "公司債"))
+        else:
+            texts.append(mops_subject_search_text(record, date_value, "現金增資"))
         if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
             bond_params = dict(params)
             bond_params["TYPEK"] = ""
