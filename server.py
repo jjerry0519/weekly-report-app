@@ -460,6 +460,33 @@ def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
     return "\n".join(texts)
 
 
+def mops_follow_detail_links(text: str) -> str:
+    links: list[str] = []
+    for raw in re.findall(r"""(?:href|action)=["']([^"']*t05sr01_1[^"']*)["']""", text, flags=re.I):
+        link = html.unescape(raw)
+        if link.startswith("/"):
+            links.append("https://mops.twse.com.tw" + link)
+            links.append("https://mopsov.twse.com.tw" + link)
+        elif link.startswith("http"):
+            links.append(link)
+    for raw in re.findall(r"""(?:https?://[^"'\s<>]+|/mops/web/[^"'\s<>]+)""", text, flags=re.I):
+        if "t05sr01_1" not in raw:
+            continue
+        link = html.unescape(raw)
+        if link.startswith("/"):
+            links.append("https://mops.twse.com.tw" + link)
+            links.append("https://mopsov.twse.com.tw" + link)
+        else:
+            links.append(link)
+    detail_texts: list[str] = []
+    for link in dict.fromkeys(links):
+        try:
+            detail_texts.append(public_fetch_text(link, timeout=MOPS_TIMEOUT_SECONDS))
+        except Exception:
+            continue
+    return "\n".join(detail_texts)
+
+
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     dates: list[dt.date] = []
@@ -477,11 +504,17 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
             "year": f"{roc_year(date_value):03d}",
             "month": f"{date_value.month:02d}",
         }
-        texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
-        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params))
+        for query_text in (
+            mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params),
+            mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params),
+        ):
+            texts.append(query_text)
+            texts.append(mops_follow_detail_links(query_text))
         keyword_params = dict(params)
         keyword_params["keyWord"] = "轉換公司債" if record.get("分類") in ("CB", "ECB", "EB") else "現金增資"
-        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params))
+        keyword_text = mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params)
+        texts.append(keyword_text)
+        texts.append(mops_follow_detail_links(keyword_text))
         if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
             bond_params = dict(params)
             bond_params["TYPEK"] = ""
@@ -1011,16 +1044,22 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     anchor_positions = [pos for pos in anchor_positions if pos >= 0]
     if anchor_positions:
         pos = min(anchor_positions)
-        search_compact = search_compact[pos : pos + 1200]
+        search_compact = search_compact[pos : pos + 6000]
     for match in re.finditer(r"(?:債券簡稱|簡稱)[：:]\s*([^，,。；;\s()（）]{2,24})", compact):
         candidate = clean_explicit_bond_short(match.group(1))
         if candidate:
             return normalize_bond_product_name(candidate, record)
-    bond_pattern = r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,80}?(?:(?:有|無)?擔保)?(?:可)?(?:轉換|交換)公司債"
-    for match in re.finditer(bond_pattern, search_compact):
-        ordinal = chinese_ordinal_to_short(match.group(1))
-        if base:
-            return bond_name_with_ordinal(base, ordinal, record)
+    bond_patterns = (
+        r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,160}?(?:(?:有|無)?擔保)?(?:可)?(?:轉換|交換)公司債",
+        r"(?:發行|辦理|募集)[^。；，]{0,160}?(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,160}?(?:轉換|交換)公司債",
+        r"(?:轉換|交換)公司債[^。；，]{0,160}?(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次",
+        r"(?:國內|海外)?(?:第)?([一二三四五六七八九十百\d]+)次[^。；，]{0,160}?公司債",
+    )
+    for bond_pattern in bond_patterns:
+        for match in re.finditer(bond_pattern, search_compact):
+            ordinal = chinese_ordinal_to_short(match.group(1))
+            if base:
+                return bond_name_with_ordinal(base, ordinal, record)
     return ""
 
 
