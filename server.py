@@ -2650,10 +2650,26 @@ def group_for_email(records: list[dict[str, str]]) -> list[str]:
     return lines
 
 
-def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "") -> dict[str, object]:
+def week_from_records(records: list[dict[str, str]]) -> tuple[dt.date, dt.date]:
+    """Derive Mon-Fri window from the latest 收文日期 in the source file."""
+    latest: dt.date | None = None
+    for r in records:
+        d = parse_date(r.get("收文日期", ""))
+        if d and (latest is None or d > latest):
+            latest = d
+    if latest is None:
+        latest = current_friday()
+    # Snap to the Friday of that week, then back to Monday
+    monday = latest - dt.timedelta(days=latest.weekday())
+    friday = monday + dt.timedelta(days=4)
+    return monday, friday
+
+
+def build_report(source_path: Path, source_url: str = "") -> dict[str, object]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     records = extract_records(source_path)
+    start, end = week_from_records(records)
     new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
     amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
     stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
@@ -2828,18 +2844,10 @@ HTML = """<!doctype html>
   <main><div class="wrap">
     <form id="uploadForm" method="post" action="/api/generate-upload" enctype="multipart/form-data"></form>
     <section>
-      <h2>設定截止日期</h2>
-      <div class="controls">
-        <label>截止週五
-          <input id="endDate" name="end" form="uploadForm" type="date">
-        </label>
-      </div>
+      <h2>上傳來源檔</h2>
       <p id="status" class="status"></p>
       <div id="metrics" class="grid" hidden></div>
-    </section>
-    <section>
-      <h2>上傳來源檔</h2>
-      <p class="hint">上傳證期局每週下載的「申報案件彙總表」，系統自動以截止週五往回推算本周一至周五，標藍當週新增或變動資料。</p>
+      <p class="hint">上傳證期局每週下載的「申報案件彙總表」，系統自動以檔案最新收文日期推算當週（週一至週五），標藍當週新增或變動資料。</p>
       <div class="controls">
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls" required>
@@ -2857,7 +2865,6 @@ HTML = """<!doctype html>
     </section>
   </div></main>
   <script>
-    let endDate;
     let statusEl;
     let uploadBtn;
     let sourceFile;
@@ -2865,29 +2872,9 @@ HTML = """<!doctype html>
     let metrics;
     let emailBox;
 
-    function currentFriday() {
-      const d = new Date();
-      const day = d.getDay(); // 0=Sun,1=Mon,...,5=Fri,6=Sat
-      const daysToFriday = (5 - day + 7) % 7;
-      d.setDate(d.getDate() + daysToFriday);
-      return d.toISOString().slice(0, 10);
-    }
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
       statusEl.className = "status" + (isError ? " error" : "");
-    }
-
-    function reportRangeText() {
-      const end = new Date(`${endDate.value}T00:00:00`);
-      if (Number.isNaN(end.getTime())) return "";
-      const start = new Date(end);
-      start.setDate(start.getDate() - 4);
-      const fmt = d => d.toISOString().slice(0, 10);
-      return `處理區間：${fmt(start)} ～ ${fmt(end)}（週一至週五）`;
-    }
-
-    function updateRangePreview() {
-      setStatus(reportRangeText());
     }
     function renderMetrics(counts) {
       metrics.hidden = false;
@@ -2938,7 +2925,7 @@ HTML = """<!doctype html>
         try {
           const form = new FormData();
           form.append("source", file);
-          const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
+          const res = await fetch(`/api/generate-upload`, { method: "POST", body: form });
           const responseText = await res.text();
           let data = {};
           try {
@@ -2962,7 +2949,6 @@ HTML = """<!doctype html>
     }
 
     document.addEventListener("DOMContentLoaded", () => {
-      endDate = document.querySelector("#endDate");
       statusEl = document.querySelector("#status");
       uploadBtn = document.querySelector("#uploadBtn");
       sourceFile = document.querySelector("#sourceFile");
@@ -2970,14 +2956,11 @@ HTML = """<!doctype html>
       metrics = document.querySelector("#metrics");
       emailBox = document.querySelector("#emailBox");
 
-      if (!endDate || !statusEl || !uploadBtn || !sourceFile || !list || !metrics || !emailBox) {
+      if (!statusEl || !uploadBtn || !sourceFile || !list || !metrics || !emailBox) {
         document.body.insertAdjacentHTML("afterbegin", "<p style='padding:12px;color:#b00020'>頁面元件載入不完整，請重新整理。</p>");
         return;
       }
 
-      endDate.value = currentFriday();
-      updateRangePreview();
-      endDate.addEventListener("change", updateRangePreview);
       uploadBtn.addEventListener("click", handleUpload);
 
       loadReports().catch(err => {
@@ -3054,12 +3037,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         try:
-            query = urllib.parse.parse_qs(parsed.query)
-            end_text = query.get("end", [""])[0]
-            end = dt.date.fromisoformat(end_text) if end_text else current_friday()
-            start, end = report_window(end)
-            source_path, source_url = download_latest_source(end)
-            result = build_report(source_path, start, end, source_url)
+            source_path, source_url = download_latest_source(current_friday())
+            result = build_report(source_path, source_url)
             self.send_json(200, result)
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
@@ -3068,12 +3047,8 @@ class Handler(BaseHTTPRequestHandler):
         accept = self.headers.get("Accept", "")
         wants_html = "text/html" in accept and "application/json" not in accept
         try:
-            query = urllib.parse.parse_qs(parsed.query)
             source_path, fields = self.save_uploaded_xlsx()
-            end_text = query.get("end", [""])[0] or fields.get("end", "")
-            end = dt.date.fromisoformat(end_text) if end_text else current_friday()
-            start, end = report_window(end)
-            result = build_report(source_path, start, end, "uploaded")
+            result = build_report(source_path, "uploaded")
             if wants_html:
                 self.send_result_html(200, result)
             else:
