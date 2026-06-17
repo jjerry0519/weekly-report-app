@@ -33,7 +33,6 @@ SOURCE_DIR = BASE_DIR / "sources"
 TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_PATH = TEMPLATE_DIR / "同業送件明細樣板.xlsx"
 SFB_PAGE = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
-REPORT_WINDOW_DAYS = 7
 ENABLE_ONLINE_MOPS_LOOKUP = os.environ.get("ENABLE_ONLINE_MOPS_LOOKUP", "1").lower() in {"1", "true", "yes", "on"}
 MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "6"))
 
@@ -62,18 +61,19 @@ def roc_year(date: dt.date) -> int:
     return date.year - 1911
 
 
-def latest_thursday(today: dt.date | None = None) -> dt.date:
+def current_friday(today: dt.date | None = None) -> dt.date:
     today = today or dt.date.today()
-    return today - dt.timedelta(days=(today.weekday() - 3) % 7)
+    monday = today - dt.timedelta(days=today.weekday())
+    return monday + dt.timedelta(days=4)
 
 
 def default_week(today: dt.date | None = None) -> tuple[dt.date, dt.date]:
-    end = latest_thursday(today)
-    return report_window(end)
+    friday = current_friday(today)
+    return friday - dt.timedelta(days=4), friday
 
 
 def report_window(end: dt.date) -> tuple[dt.date, dt.date]:
-    return end - dt.timedelta(days=REPORT_WINDOW_DAYS - 1), end
+    return end - dt.timedelta(days=4), end
 
 
 def roc_date(date: dt.date, sep: str = "/") -> str:
@@ -1175,7 +1175,7 @@ def enrich_records(
     purpose_keys: set[str] | None = None,
 ) -> list[str]:
     warnings: list[str] = []
-    end = end or latest_thursday()
+    end = end or current_friday()
     lookup_jobs: list[tuple[dict[str, str], tuple[str, str, str], bool, bool, bool]] = []
     for record in records:
         key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
@@ -2540,10 +2540,6 @@ def update_template_workbook_openpyxl(
     source_url: str,
     template_path: Path | None,
     base_records: list[dict[str, str]],
-    new_records: list[dict[str, str]],
-    amend_records: list[dict[str, str]],
-    stop_records: list[dict[str, str]],
-    effective_records: list[dict[str, str]],
     counts: dict[str, int],
 ) -> Path:
     template = template_path if template_path and template_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path)
@@ -2554,247 +2550,27 @@ def update_template_workbook_openpyxl(
     detail_sheet = find_openpyxl_detail_sheet(workbook, end)
     summary_sheet = find_openpyxl_summary_sheet(workbook, end)
 
-    existing_by_key: dict[str, tuple[int, dict[str, str]]] = {}
-    for row_num in range(4, detail_sheet.max_row + 1):
-        record = detail_row_record_from_sheet(detail_sheet, row_num)
-        key = record_key(record)
-        if key.strip("|"):
-            existing_by_key[key] = (row_num, record)
-
-    last_row = last_detail_row(detail_sheet)
-    template_row = max(4, last_row)
-    source_by_key = {record_key(record): record for record in base_records}
+    template_row = 4
     weekly_keys: set[str] = set()
-    for key, record in source_by_key.items():
-        if key in existing_by_key:
-            row_num, existing_record = existing_by_key[key]
-            blue_cols = compare_blue_columns(existing_record, record)
-            if is_bond_product_name(existing_record.get("公司名稱", "")) and not is_bond_product_name(record.get("顯示名稱", "")):
-                record["顯示名稱"] = existing_record["公司名稱"]
-            if not record.get("本次籌資計畫", "").strip() and existing_record.get("本次籌資計畫", "").strip():
-                record["本次籌資計畫"] = existing_record["本次籌資計畫"]
-            if blue_cols:
-                weekly_keys.add(key)
-            update_existing_detail_row(detail_sheet, row_num, record, blue_cols)
-            continue
-        last_row += 1
-        blue_cols = compare_blue_columns(None, record)
-        weekly_keys.add(key)
-        write_detail_row(detail_sheet, last_row, record, blue_cols, template_row)
 
+    for idx, record in enumerate(base_records):
+        row_num = 4 + idx
+        blue_cols = weekly_blue_columns(record, start, end)
+        if blue_cols:
+            weekly_keys.add(record_key(record))
+        write_detail_row(detail_sheet, row_num, record, blue_cols, template_row)
+
+    # 清除樣板多餘的舊資料列
+    for row_num in range(4 + len(base_records), (detail_sheet.max_row or 3) + 1):
+        for col_idx in range(1, 27):
+            detail_sheet.cell(row_num, col_idx).value = None
+
+    new_records = [r for r in base_records if in_range(r.get("收文日期", ""), start, end)]
     update_summary_sheet_openpyxl(summary_sheet, base_records, new_records, start, end, weekly_keys)
     workbook.save(target)
     return target
 
 
-def update_template_workbook(
-    source_path: Path,
-    start: dt.date,
-    end: dt.date,
-    source_url: str,
-    template_path: Path | None,
-    base_records: list[dict[str, str]],
-    new_records: list[dict[str, str]],
-    amend_records: list[dict[str, str]],
-    stop_records: list[dict[str, str]],
-    effective_records: list[dict[str, str]],
-    counts: dict[str, int],
-) -> Path:
-    return update_template_workbook_openpyxl(
-        source_path,
-        start,
-        end,
-        source_url,
-        template_path,
-        base_records,
-        new_records,
-        amend_records,
-        stop_records,
-        effective_records,
-        counts,
-    )
-
-    template = template_path if template_path and template_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else source_path)
-    filename = f"同業送件明細(截至{compact_roc_date(end)}).xlsx"
-    target = available_report_path(REPORT_DIR / filename)
-    with zipfile.ZipFile(template, "r") as zin:
-        names = zin.namelist()
-        shared_xml = zin.read("xl/sharedStrings.xml").decode("utf-8") if "xl/sharedStrings.xml" in names else '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="0" uniqueCount="0"></sst>'
-        shared_xml = clear_previous_blue_runs(shared_xml)
-        shared = xlsx_shared_strings(zin)
-        styles = XlsxStyleManager(zin.read("xl/styles.xml").decode("utf-8")) if "xl/styles.xml" in names else XlsxStyleManager("")
-        paths = sheet_path_map(zin)
-        detail_path = find_sheet_path(paths, f"{roc_year(end)}年本次籌資計畫", ("本次籌資計畫",), "xl/worksheets/sheet2.xml")
-        summary_path = find_sheet_path(paths, f"{roc_year(end)}年", ("年",), "xl/worksheets/sheet1.xml")
-        detail_xml = clear_blue_cell_styles(zin.read(detail_path).decode("utf-8"), styles)
-        summary_xml = clear_blue_cell_styles(zin.read(summary_path).decode("utf-8"), styles)
-
-        detail_rows = [
-            (int(match.group(1)), match.group(0))
-            for match in re.finditer(r'<row\b[^>]*\br="(\d+)"[^>]*>[\s\S]*?</row>', detail_xml)
-        ]
-        existing_by_key: dict[str, tuple[int, ET.Element, dict[str, str]]] = {}
-        for row_num, row_xml in detail_rows:
-            if row_num <= 3:
-                continue
-            values = row_values_from_xml(row_xml, shared)
-            record = detail_row_to_record(values)
-            key = record_key(record)
-            if key.strip("|"):
-                existing_by_key[key] = (row_num, row_xml, values)  # type: ignore[assignment]
-
-        last_row_num = max(row_num for row_num, _ in detail_rows)
-        last_data_row_num, last_data_row_xml = max((item for item in detail_rows if item[0] >= 4), key=lambda item: item[0])
-        weekly_keys = {record_key(r) for r in new_records + amend_records + stop_records + effective_records}
-        source_by_key = {record_key(r): r for r in base_records}
-
-        for key, record in source_by_key.items():
-            is_weekly = key in weekly_keys
-            if key in existing_by_key:
-                row_num, row_xml, existing = existing_by_key[key]  # type: ignore[misc]
-                original_row_xml = row_xml
-                for field, col in DETAIL_COLS.items():
-                    old_value = existing.get(col, "")
-                    new_value = record.get(field, "")
-                    close_type_changed = field == "結案類型" and old_value != new_value and new_value and is_weekly
-                    date_field_changed = field in ("自動補正日期", "停止生效日期", "解除生效日期", "生效日期", "廢止/撤銷日期", "自行撤回日期", "退件日期") and old_value != new_value and new_value
-                    date_is_weekly = date_field_changed and in_range(new_value, start, end)
-                    if close_type_changed or date_field_changed:
-                        base_style = cell_style_from_row(row_xml, col, row_num)
-                        style = styles.blue_style(base_style) if close_type_changed or date_is_weekly else base_style
-                        row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, style)
-                if record_key(record) in {record_key(r) for r in new_records}:
-                    purpose_values = split_purpose(record)
-                    for index, col in enumerate(PURPOSE_COLS):
-                        old_value = existing.get(col, "")
-                        new_value = purpose_values[index] if index < len(purpose_values) else ""
-                        if old_value != new_value:
-                            base_style = cell_style_from_row(row_xml, col, row_num)
-                            style = styles.blue_style(base_style) if new_value else base_style
-                            row_xml = upsert_cell_xml(row_xml, row_num, col, new_value, style)
-                detail_xml = replace_exact_row_xml(detail_xml, original_row_xml, row_xml)
-                continue
-            if not is_weekly:
-                continue
-            last_row_num += 1
-            new_row_xml = clone_row_xml(last_data_row_xml, last_data_row_num, last_row_num)
-            for field, col in DETAIL_COLS.items():
-                value = record.get(field, "")
-                base_style = cell_style_from_row(new_row_xml, col, last_row_num)
-                style = styles.blue_style(base_style) if str(value).strip() else base_style
-                new_row_xml = upsert_cell_xml(new_row_xml, last_row_num, col, value, style)
-            for col, value in zip(PURPOSE_COLS, split_purpose(record)):
-                base_style = cell_style_from_row(new_row_xml, col, last_row_num)
-                style = styles.blue_style(base_style) if str(value).strip() else base_style
-                new_row_xml = upsert_cell_xml(new_row_xml, last_row_num, col, value, style)
-            detail_xml = append_row_xml(detail_xml, new_row_xml)
-
-        detail_xml = update_dimension_xml(detail_xml, "Z", last_row_num)
-
-        summary_rows = [
-            (int(match.group(1)), match.group(0))
-            for match in re.finditer(r'<row\b[^>]*\br="(\d+)"[^>]*>[\s\S]*?</row>', summary_xml)
-        ]
-        broker_rows: dict[str, tuple[int, str]] = {}
-        for row_num, row_xml in summary_rows:
-            if row_num < 4:
-                continue
-            values = row_values_from_xml(row_xml, shared)
-            broker = clean_broker(values.get("A", ""))
-            if broker:
-                broker_rows[broker] = (row_num, row_xml)
-
-        year_records = [r for r in base_records if (parse_date(r.get("收文日期", "")) or start) <= end]
-        by_broker: dict[str, dict[str, list[str]]] = {}
-        weekly_broker_codes: set[tuple[str, str]] = set()
-        for record in year_records:
-            broker = clean_broker(record.get("承銷商", "")) or "未填"
-            code = record.get("分類", "其他")
-            by_broker.setdefault(broker, {"CI": [], "CB": [], "ECB": [], "GDR": [], "EB": []})
-            if code in by_broker[broker]:
-                by_broker[broker][code].append(record.get("顯示名稱") or record.get("公司名稱", ""))
-            if record_key(record) in weekly_keys:
-                weekly_broker_codes.add((broker, code))
-
-        row1_original = get_row_xml(summary_xml, 1)
-        row1 = upsert_cell_xml(row1_original, 1, "BB", f"更新日期：{roc_date(end)}", cell_style_from_row(row1_original, "BB", 1))
-        summary_xml = replace_exact_row_xml(summary_xml, row1_original, row1)
-        row2_original = get_row_xml(summary_xml, 2)
-        row2 = upsert_cell_xml(row2_original, 2, "AX", f"{roc_year(end)}.01.01~{roc_date(end)}", cell_style_from_row(row2_original, "AX", 2))
-        summary_xml = replace_exact_row_xml(summary_xml, row2_original, row2)
-        weekly_by_broker: dict[str, dict[str, list[str]]] = {}
-        for record in new_records:
-            broker = clean_broker(record.get("承銷商", "")) or "未填"
-            code = record.get("分類", "其他")
-            weekly_by_broker.setdefault(broker, {"CI": [], "CB": [], "ECB": [], "GDR": [], "EB": []})
-            if code in weekly_by_broker[broker]:
-                weekly_by_broker[broker][code].append(record.get("顯示名稱") or record.get("公司名稱", ""))
-
-        for broker, code_map in by_broker.items():
-            if broker not in broker_rows:
-                continue
-            if broker == "合計":
-                continue
-            row_num, row = broker_rows[broker]
-            original_row = row
-            total = sum(len(items) for items in code_map.values())
-            row = upsert_cell_xml(row, row_num, "AX", total, None)
-            current_values = row_values_from_xml(row, shared)
-            for col, code in (("AY", "CI"), ("AZ", "CB"), ("BA", "ECB"), ("BB", "GDR"), ("BC", "EB")):
-                existing_text = current_values.get(col, "").strip()
-                weekly_names = [name for name in weekly_by_broker.get(broker, {}).get(code, []) if name]
-                additions = [name for name in weekly_names if name and name not in existing_text]
-                if additions:
-                    suffix = "、".join(additions)
-                    final_text = f"{existing_text}、{suffix}" if existing_text else suffix
-                    shared_xml, shared_index = append_shared_string(shared_xml, final_text, suffix)
-                    row = upsert_shared_cell_xml(row, row_num, col, shared_index, cell_style_from_row(row, col, row_num))
-                    shared.append(final_text)
-                elif not existing_text:
-                    company_names = "、".join(name for name in code_map.get(code, []) if name)
-                    if company_names:
-                        shared_xml, shared_index = append_shared_string(shared_xml, company_names)
-                        row = upsert_shared_cell_xml(row, row_num, col, shared_index, cell_style_from_row(row, col, row_num))
-            summary_xml = replace_exact_row_xml(summary_xml, original_row, row)
-
-        if "合計" in broker_rows:
-            row_num, row = broker_rows["合計"]
-            original_row = row
-            total_counts = {
-                "CI": sum(len(code_map.get("CI", [])) for code_map in by_broker.values()),
-                "CB": sum(len(code_map.get("CB", [])) for code_map in by_broker.values()),
-                "ECB": sum(len(code_map.get("ECB", [])) for code_map in by_broker.values()),
-                "GDR": sum(len(code_map.get("GDR", [])) for code_map in by_broker.values()),
-                "EB": sum(len(code_map.get("EB", [])) for code_map in by_broker.values()),
-            }
-            row = set_cell_cached_value_xml(row, row_num, "AX", sum(total_counts.values()))
-            for col, code in (("AY", "CI"), ("AZ", "CB"), ("BA", "ECB"), ("BB", "GDR"), ("BC", "EB")):
-                row = set_cell_cached_value_xml(row, row_num, col, total_counts[code])
-            summary_xml = replace_exact_row_xml(summary_xml, original_row, row)
-
-        with zipfile.ZipFile(target, "w", compression=zipfile.ZIP_DEFLATED) as zout:
-            for name in names:
-                if name == detail_path:
-                    zout.writestr(name, detail_xml.encode("utf-8"))
-                elif name == summary_path:
-                    zout.writestr(name, summary_xml.encode("utf-8"))
-                elif name == "xl/styles.xml":
-                    zout.writestr(name, styles.finalize().encode("utf-8"))
-                elif name == "xl/sharedStrings.xml":
-                    zout.writestr(name, shared_xml.encode("utf-8"))
-                elif name == "[Content_Types].xml":
-                    content_types = zin.read(name).decode("utf-8")
-                    content_types = re.sub(r'<Override[^>]+PartName="/xl/calcChain.xml"[^>]*/>', "", content_types)
-                    zout.writestr(name, content_types.encode("utf-8"))
-                elif name == "xl/_rels/workbook.xml.rels":
-                    rels_xml = zin.read(name).decode("utf-8")
-                    rels_xml = re.sub(r'<Relationship[^>]+Target="calcChain.xml"[^>]*/>', "", rels_xml)
-                    zout.writestr(name, rels_xml.encode("utf-8"))
-                elif name == "xl/calcChain.xml":
-                    continue
-                else:
-                    zout.writestr(name, zin.read(name))
-    return target
 
 
 def available_report_path(path: Path) -> Path:
@@ -2827,38 +2603,14 @@ def group_for_email(records: list[dict[str, str]]) -> list[str]:
     return lines
 
 
-def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "", base_path: Path | None = None) -> dict[str, object]:
+def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: str = "") -> dict[str, object]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     records = extract_records(source_path)
-    previous_records: list[dict[str, str]] = []
-    if base_path and base_path.exists():
-        try:
-            previous_records = extract_records(base_path)
-        except Exception:
-            previous_records = []
-    previous_by_key = {record_key(record): record for record in previous_records}
-    if previous_by_key:
-        new_records: list[dict[str, str]] = []
-        amend_records: list[dict[str, str]] = []
-        stop_records: list[dict[str, str]] = []
-        effective_records: list[dict[str, str]] = []
-        for record in records:
-            previous = previous_by_key.get(record_key(record))
-            if previous is None:
-                new_records.append(record)
-                continue
-            if changed_value(previous.get("自動補正日期", ""), record.get("自動補正日期", "")):
-                amend_records.append(record)
-            if changed_value(previous.get("停止生效日期", ""), record.get("停止生效日期", "")):
-                stop_records.append(record)
-            if changed_value(previous.get("生效日期", ""), record.get("生效日期", "")):
-                effective_records.append(record)
-    else:
-        new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
-        amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
-        stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
-        effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
+    new_records = [r for r in records if in_range(r.get("收文日期", ""), start, end)]
+    amend_records = [r for r in records if in_range(r.get("自動補正日期", ""), start, end)]
+    stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
+    effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
     weekly_records = unique_records(new_records + amend_records + stop_records + effective_records)
     lookup_focus = {record_key(r) for r in weekly_records}
     purpose_focus = {record_key(r) for r in weekly_records}
@@ -2911,19 +2663,15 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
         "lookupWarnings": len(lookup_warnings),
     }
 
-    template_path = base_path if base_path and base_path.exists() else (TEMPLATE_PATH if TEMPLATE_PATH.exists() else None)
+    template_path = TEMPLATE_PATH if TEMPLATE_PATH.exists() else None
     if template_path is not None:
-        target = update_template_workbook(
+        target = update_template_workbook_openpyxl(
             source_path,
             start,
             end,
             source_url,
             template_path,
             records,
-            new_records,
-            amend_records,
-            stop_records,
-            effective_records,
             counts,
         )
     else:
@@ -2960,7 +2708,6 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
         "end": end.isoformat(),
         "rocRange": f"{roc_date(start)}～{roc_date(end)}",
         "source": source_path.name,
-        "base": base_path.name if base_path else "",
         "sourceUrl": source_url,
         "counts": counts,
         "lookupWarnings": lookup_warnings,
@@ -3032,7 +2779,7 @@ HTML = """<!doctype html>
     <section>
       <h2>設定截止日期</h2>
       <div class="controls">
-        <label>截止週四
+        <label>截止週五
           <input id="endDate" name="end" form="uploadForm" type="date">
         </label>
       </div>
@@ -3040,16 +2787,13 @@ HTML = """<!doctype html>
       <div id="metrics" class="grid" hidden></div>
     </section>
     <section>
-      <h2>手動上傳來源檔</h2>
-      <p class="hint">請上傳上週產出的「同業送件明細」當基準檔，再上傳你每週下載好的「申報案件彙總表」。系統會保留舊資料，只有截止日前 7 天（含截止日）的新增或變動資料標藍。</p>
+      <h2>上傳來源檔</h2>
+      <p class="hint">上傳證期局每週下載的「申報案件彙總表」，系統自動以截止週五往回推算本周一至周五，標藍當週新增或變動資料。</p>
       <div class="controls">
-        <label>上週同業送件明細
-          <input id="baseFile" name="base" form="uploadForm" type="file" accept=".xlsx,.xls" required>
-        </label>
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls" required>
         </label>
-        <button id="uploadBtn" form="uploadForm" type="submit">用上傳檔產出</button>
+        <button id="uploadBtn" form="uploadForm" type="submit">產出</button>
       </div>
     </section>
     <section>
@@ -3065,17 +2809,16 @@ HTML = """<!doctype html>
     let endDate;
     let statusEl;
     let uploadBtn;
-    let baseFile;
     let sourceFile;
     let list;
     let metrics;
     let emailBox;
 
-    function latestThursday() {
+    function currentFriday() {
       const d = new Date();
-      const day = d.getDay();
-      const diff = (day + 3) % 7;
-      d.setDate(d.getDate() - diff);
+      const day = d.getDay(); // 0=Sun,1=Mon,...,5=Fri,6=Sat
+      const daysToFriday = (5 - day + 7) % 7;
+      d.setDate(d.getDate() + daysToFriday);
       return d.toISOString().slice(0, 10);
     }
     function setStatus(text, isError = false) {
@@ -3087,9 +2830,9 @@ HTML = """<!doctype html>
       const end = new Date(`${endDate.value}T00:00:00`);
       if (Number.isNaN(end.getTime())) return "";
       const start = new Date(end);
-      start.setDate(start.getDate() - 6);
+      start.setDate(start.getDate() - 4);
       const fmt = d => d.toISOString().slice(0, 10);
-      return `處理區間：${fmt(start)} ～ ${fmt(end)}（含截止日，共 7 天）`;
+      return `處理區間：${fmt(start)} ～ ${fmt(end)}（週一至週五）`;
     }
 
     function updateRangePreview() {
@@ -3132,12 +2875,7 @@ HTML = """<!doctype html>
 
     async function handleUpload(event) {
       if (event) event.preventDefault();
-      const base = baseFile.files[0];
       const file = sourceFile.files[0];
-      if (!base) {
-        setStatus("請先選擇上週產出的同業送件明細，否則資料無法連續累積。", true);
-        return;
-      }
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
         return;
@@ -3145,10 +2883,9 @@ HTML = """<!doctype html>
         uploadBtn.disabled = true;
         metrics.hidden = true;
         emailBox.value = "";
-        setStatus("正在用上傳檔產出 Excel...");
+        setStatus("正在產出 Excel...");
         try {
           const form = new FormData();
-          form.append("base", base);
           form.append("source", file);
           const res = await fetch(`/api/generate-upload?end=${encodeURIComponent(endDate.value)}`, { method: "POST", body: form });
           const responseText = await res.text();
@@ -3177,18 +2914,17 @@ HTML = """<!doctype html>
       endDate = document.querySelector("#endDate");
       statusEl = document.querySelector("#status");
       uploadBtn = document.querySelector("#uploadBtn");
-      baseFile = document.querySelector("#baseFile");
       sourceFile = document.querySelector("#sourceFile");
       list = document.querySelector("#reportList");
       metrics = document.querySelector("#metrics");
       emailBox = document.querySelector("#emailBox");
 
-      if (!endDate || !statusEl || !uploadBtn || !baseFile || !sourceFile || !list || !metrics || !emailBox) {
+      if (!endDate || !statusEl || !uploadBtn || !sourceFile || !list || !metrics || !emailBox) {
         document.body.insertAdjacentHTML("afterbegin", "<p style='padding:12px;color:#b00020'>頁面元件載入不完整，請重新整理。</p>");
         return;
       }
 
-      endDate.value = latestThursday();
+      endDate.value = currentFriday();
       updateRangePreview();
       endDate.addEventListener("change", updateRangePreview);
       uploadBtn.addEventListener("click", handleUpload);
@@ -3269,7 +3005,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             query = urllib.parse.parse_qs(parsed.query)
             end_text = query.get("end", [""])[0]
-            end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
+            end = dt.date.fromisoformat(end_text) if end_text else current_friday()
             start, end = report_window(end)
             source_path, source_url = download_latest_source(end)
             result = build_report(source_path, start, end, source_url)
@@ -3282,13 +3018,11 @@ class Handler(BaseHTTPRequestHandler):
         wants_html = "text/html" in accept and "application/json" not in accept
         try:
             query = urllib.parse.parse_qs(parsed.query)
-            source_path, base_path, fields = self.save_uploaded_xlsx()
-            if base_path is None:
-                raise ValueError("請上傳上週產出的同業送件明細，否則資料無法連續累積。")
+            source_path, fields = self.save_uploaded_xlsx()
             end_text = query.get("end", [""])[0] or fields.get("end", "")
-            end = dt.date.fromisoformat(end_text) if end_text else latest_thursday()
+            end = dt.date.fromisoformat(end_text) if end_text else current_friday()
             start, end = report_window(end)
-            result = build_report(source_path, start, end, "uploaded", base_path=base_path)
+            result = build_report(source_path, start, end, "uploaded")
             if wants_html:
                 self.send_result_html(200, result)
             else:
@@ -3338,7 +3072,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def save_uploaded_xlsx(self) -> tuple[Path, Path | None, dict[str, str]]:
+    def save_uploaded_xlsx(self) -> tuple[Path, dict[str, str]]:
         content_type = self.headers.get("Content-Type", "")
         match = re.search(r"boundary=(.+)", content_type)
         if not match:
@@ -3349,7 +3083,6 @@ class Handler(BaseHTTPRequestHandler):
         parts = body.split(b"--" + boundary)
         fields: dict[str, str] = {}
         source_path: Path | None = None
-        base_path: Path | None = None
         for part in parts:
             if b"Content-Disposition:" not in part:
                 continue
@@ -3370,15 +3103,11 @@ class Handler(BaseHTTPRequestHandler):
             filename = Path(filename).name or "source.xlsx"
             if not filename.lower().endswith((".xlsx", ".xls")):
                 raise ValueError("請上傳 Excel 檔。")
-            prefix = "base" if field_name == "base" else "source"
-            target = SOURCE_DIR / f"{prefix}_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
+            target = SOURCE_DIR / f"source_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}_{filename}"
             target.write_bytes(data)
-            if field_name == "base":
-                base_path = target
-            else:
-                source_path = target
+            source_path = target
         if source_path is not None:
-            return source_path, base_path, fields
+            return source_path, fields
         raise ValueError("沒有收到證期局來源 Excel 檔。")
 
 
