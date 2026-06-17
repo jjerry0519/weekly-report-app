@@ -883,10 +883,16 @@ def bond_name_with_ordinal(base: str, ordinal: str, record: dict[str, str]) -> s
     stock = normalize_stock_short_for_bond(base)
     if not stock:
         return ""
-    prefix = "海外" if record.get("分類") == "ECB" and "海外" not in ordinal else ""
+    if record.get("分類") == "ECB":
+        # ECB convention: arabic numeral with "ECB" prefix, e.g. 華邦電ECB4
+        num = ordinal_to_int(ordinal)
+        arabic = str(num) if num is not None else ordinal
+        if stock.endswith("-KY"):
+            return f"{stock[:-3]}ECB{arabic}-KY"
+        return f"{stock}ECB{arabic}"
     if stock.endswith("-KY"):
-        return f"{stock[:-3]}{prefix}{ordinal}-KY"
-    return f"{stock}{prefix}{ordinal}"
+        return f"{stock[:-3]}{ordinal}-KY"
+    return f"{stock}{ordinal}"
 
 
 def normalize_bond_product_name(value: str, record: dict[str, str]) -> str:
@@ -2571,8 +2577,6 @@ def update_template_workbook_openpyxl(
     return target
 
 
-
-
 def available_report_path(path: Path) -> Path:
     if not path.exists():
         return path
@@ -2612,8 +2616,12 @@ def build_report(source_path: Path, start: dt.date, end: dt.date, source_url: st
     stop_records = [r for r in records if in_range(r.get("停止生效日期", ""), start, end)]
     effective_records = [r for r in records if in_range(r.get("生效日期", ""), start, end)]
     weekly_records = unique_records(new_records + amend_records + stop_records + effective_records)
-    lookup_focus = {record_key(r) for r in weekly_records}
-    purpose_focus = {record_key(r) for r in weekly_records}
+    # All CB/ECB/EB records need ordinal names for the 115年 summary sheet,
+    # not just this week's new entries. CI/GDR only need company short names.
+    all_bond_keys = {record_key(r) for r in records if r.get("分類") in ("CB", "ECB", "EB")}
+    weekly_keys_set = {record_key(r) for r in weekly_records}
+    lookup_focus = weekly_keys_set | all_bond_keys
+    purpose_focus = weekly_keys_set
     lookup_warnings = enrich_records(records, end=end, focus_keys=lookup_focus, purpose_keys=purpose_focus)
     missing_purpose = [r for r in new_records if not r.get("本次籌資計畫", "").strip()]
 
