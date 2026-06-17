@@ -275,7 +275,8 @@ BOND_SHORT_NAMES = {
 
 MOPS_TIMEOUT_SECONDS = 4
 
-MOPS_ENRICHMENTS = {
+# Hard-coded seed entries (bootstraps the cache on first deploy)
+MOPS_ENRICHMENTS: dict[tuple[str, str, str], dict[str, str]] = {
     ("1295", "CB", "400000000"): {"display": "生合一", "purpose": "償還銀行借款"},
     ("1295", "CI", "31250000"): {"display": "生合", "purpose": "償還銀行借款"},
     ("5291", "CB", "200000000"): {"display": "邑昇二", "purpose": "償還銀行借款"},
@@ -287,6 +288,41 @@ MOPS_ENRICHMENTS = {
     ("6223", "CB", "5000000000"): {"display": "旺矽六", "purpose": "充實營運資金"},
     ("3372", "CI", "600000000"): {"display": "典範", "purpose": "購置機器設備"},
 }
+
+BOND_CACHE_PATH = BASE_DIR / "data" / "bond_cache.json"
+_BOND_CACHE_LOCK = __import__("threading").Lock()
+
+
+def _load_bond_cache() -> None:
+    """Merge persisted cache into MOPS_ENRICHMENTS at startup."""
+    if not BOND_CACHE_PATH.exists():
+        return
+    try:
+        import json
+        raw = json.loads(BOND_CACHE_PATH.read_text(encoding="utf-8"))
+        for k, v in raw.items():
+            parts = k.split("\x00")
+            if len(parts) == 3:
+                key = (parts[0], parts[1], parts[2])
+                MOPS_ENRICHMENTS.setdefault(key, v)
+    except Exception:
+        pass
+
+
+def _save_bond_cache() -> None:
+    """Flush MOPS_ENRICHMENTS to disk (only CB/ECB/EB entries worth persisting)."""
+    try:
+        import json
+        BOND_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        keep = {"\x00".join(k): v for k, v in MOPS_ENRICHMENTS.items()
+                if k[1] in ("CB", "ECB", "EB") and v.get("display")}
+        with _BOND_CACHE_LOCK:
+            BOND_CACHE_PATH.write_text(json.dumps(keep, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+_load_bond_cache()
 
 
 def public_fetch_text(url: str, data: dict[str, str] | None = None, timeout: int = MOPS_TIMEOUT_SECONDS) -> str:
@@ -1244,10 +1280,17 @@ def enrich_records(
                         record["本次籌資計畫"] = result["purpose"]
                     else:
                         warnings.append(f"{record.get('證券代號')} {record.get('顯示名稱') or record.get('公司名稱')}：MOPS 找不到可精準比對的本次籌資計畫，已留白避免查錯，請人工確認。")
+                # Persist successful CB/ECB lookups so next run skips MOPS for known records
+                if key[1] in ("CB", "ECB", "EB") and record.get("顯示名稱"):
+                    MOPS_ENRICHMENTS[key] = {
+                        "display": record["顯示名稱"],
+                        "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", "")),
+                    }
         resolve_missing_bond_names(records, end, focus_keys, warnings)
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
         require_purposes(records, purpose_keys)
+        _save_bond_cache()
     return warnings
 
 
