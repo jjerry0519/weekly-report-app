@@ -2988,8 +2988,8 @@ HTML = """<!doctype html>
         fileListEl.style.display = "block";
         fileRows.innerHTML = reps.map(function(r) {
           return "<tr><td>" + r.file + "</td><td>" + r.modified +
-            "</td><td><a class=\"dl-btn\" href=\"/download/" +
-            encodeURIComponent(r.file) + "\">下載</a></td></tr>";
+            "</td><td><a class='dl-btn' href='/download/" +
+            encodeURIComponent(r.file) + "'>下載</a></td></tr>";
         }).join("");
       })
       .catch(function() {});
@@ -3042,8 +3042,8 @@ HTML = """<!doctype html>
                 showMetrics(j.counts);
                 emailBox.value = j.email || "";
                 var warns = (j.lookupWarnings || []);
-                var w = warns.length ? "\n\nMOPS 待確認：\n" + warns.join("\n") : "";
-                showStatus("已產出：" + j.file + "\n週期：" + j.rocRange + w, false);
+                var w = warns.length ? "\\n\\nMOPS 待確認：\\n" + warns.join("\\n") : "";
+                showStatus("已產出：" + j.file + "\\n週期：" + j.rocRange + w, false);
                 refreshFiles();
                 genBtn.disabled = false;
               } else if (j.status === "error") {
