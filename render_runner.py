@@ -44,23 +44,6 @@ def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keywor
     return "\n".join(text for text in texts if text)
 
 
-_original_lookup = server.mops_official_lookup_text
-
-
-def patched_mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
-    texts = [_original_lookup(record, end, include_bond=include_bond)]
-    received = server.parse_date(record.get("收文日期", "")) or end
-    dates: list[dt.date] = []
-    for date_value in (received, end):
-        if date_value not in dates:
-            dates.append(date_value)
-
-    classification = record.get("分類")
-    keyword = "轉換公司債" if classification in ("CB", "ECB", "EB") else "現金增資"
-
-    for date_value in dates:
-        texts.append(mops_subject_search_text(record, date_value, keyword))
-    return "\n".join(text for text in texts if text)
 
 
 _original_parse_bond_short = server.parse_bond_short_from_announcement
@@ -99,7 +82,6 @@ def patched_parse_bond_short_from_announcement(text: str, record: dict[str, str]
 
 
 server.mops_subject_search_text = mops_subject_search_text
-server.mops_official_lookup_text = patched_mops_official_lookup_text
 server.parse_bond_short_from_announcement = patched_parse_bond_short_from_announcement
 
 

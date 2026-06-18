@@ -360,11 +360,61 @@ def html_to_text(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_COMPANY_SHORT_CACHE: dict[str, str] = {}
+_BULK_COMPANY_LOADED = False
+import threading as _threading_early
+_BULK_COMPANY_LOCK = _threading_early.Lock()
+
+
+def _bulk_load_company_names() -> None:
+    """Download full company lists once and populate _COMPANY_SHORT_CACHE for all codes."""
+    global _BULK_COMPANY_LOADED
+    with _BULK_COMPANY_LOCK:
+        if _BULK_COMPANY_LOADED:
+            return
+        _BULK_COMPANY_LOADED = True
+    sources = (
+        ("json", "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"),
+        ("json", "https://openapi.twse.com.tw/v1/opendata/t187ap03_O"),
+        ("json", "https://www.tpex.org.tw/openapi/v1/t187ap03_O"),
+        ("csv",  "https://dts.twse.com.tw/opendata/t187ap03_L.csv"),
+        ("csv",  "https://dts.twse.com.tw/opendata/t187ap03_O.csv"),
+    )
+    for fmt, url in sources:
+        try:
+            text = public_fetch_text(url, timeout=8)
+            if fmt == "json":
+                rows = json.loads(text)
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    code = str(row.get("公司代號") or row.get("有價證券代號") or row.get("Code") or "").strip()
+                    name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("Name") or "").strip()
+                    if code and name and code not in _COMPANY_SHORT_CACHE:
+                        _COMPANY_SHORT_CACHE[code] = name
+            else:
+                reader = csv.DictReader(io.StringIO(text))
+                for row in reader:
+                    code = str(row.get("公司代號") or row.get("有價證券代號") or row.get("證券代號") or "").strip()
+                    name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("公司名稱") or "").strip()
+                    if code and name and code not in _COMPANY_SHORT_CACHE:
+                        _COMPANY_SHORT_CACHE[code] = name
+        except Exception:
+            continue
+
+
 def public_company_short_name(security_code: str) -> str:
+    if not _BULK_COMPANY_LOADED:
+        _bulk_load_company_names()
+    if security_code in _COMPANY_SHORT_CACHE:
+        return _COMPANY_SHORT_CACHE[security_code]
+    # Fallback: per-stock fast API
     for market in ("tse", "otc"):
         url = f"https://mis.twse.com.tw/stock/api/getStockInfo.jsp?ex_ch={market}_{security_code}.tw&json=1&delay=0"
         try:
-            data = json.loads(public_fetch_text(url, timeout=3))
+            data = json.loads(public_fetch_text(url, timeout=2))
         except Exception:
             continue
         rows = data.get("msgArray") if isinstance(data, dict) else []
@@ -377,58 +427,13 @@ def public_company_short_name(security_code: str) -> str:
                 continue
             name = str(row.get("n") or "").strip()
             if name:
+                _COMPANY_SHORT_CACHE[security_code] = name
                 return name
-    json_urls = (
-        "https://openapi.twse.com.tw/v1/opendata/t187ap03_L",
-        "https://openapi.twse.com.tw/v1/opendata/t187ap03_O",
-        "https://www.tpex.org.tw/openapi/v1/t187ap03_O",
-    )
-    csv_urls = (
-        "https://dts.twse.com.tw/opendata/t187ap03_L.csv",
-        "https://dts.twse.com.tw/opendata/t187ap03_O.csv",
-        "https://dts.twse.com.tw/opendata/t187ap03_P.csv",
-        "http://dts.twse.com.tw/opendata/t187ap03_L.csv",
-        "http://dts.twse.com.tw/opendata/t187ap03_O.csv",
-        "http://dts.twse.com.tw/opendata/t187ap03_P.csv",
-        "https://mopsfin.twse.com.tw/opendata/t187ap03_L.csv",
-        "https://mopsfin.twse.com.tw/opendata/t187ap03_O.csv",
-        "https://mopsfin.twse.com.tw/opendata/t187ap03_P.csv",
-    )
-    for url in json_urls:
-        try:
-            rows = json.loads(public_fetch_text(url, timeout=3))
-        except Exception:
-            continue
-        if not isinstance(rows, list):
-            continue
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            code = str(row.get("公司代號") or row.get("有價證券代號") or row.get("Code") or "").strip()
-            if code != security_code:
-                continue
-            name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("Name") or "").strip()
-            if name:
-                return name
-    for url in csv_urls:
-        try:
-            text = public_fetch_text(url, timeout=3)
-        except Exception:
-            continue
-        try:
-            reader = csv.DictReader(io.StringIO(text))
-            for row in reader:
-                code = str(row.get("公司代號") or row.get("有價證券代號") or row.get("證券代號") or "").strip()
-                if code != security_code:
-                    continue
-                name = str(row.get("公司簡稱") or row.get("有價證券名稱") or row.get("公司名稱") or "").strip()
-                if name:
-                    return name
-        except Exception:
-            continue
     mops_name = mops_company_short_name(security_code)
     if mops_name:
+        _COMPANY_SHORT_CACHE[security_code] = mops_name
         return mops_name
+    _COMPANY_SHORT_CACHE[security_code] = ""
     return ""
 
 
@@ -482,18 +487,20 @@ def stock_display_name(record: dict[str, str]) -> str:
 
 def mops_query_text(paths: tuple[str, ...], params: dict[str, str]) -> str:
     hosts = ("https://mopsov.twse.com.tw", "https://mops.twse.com.tw")
-    texts: list[str] = []
-    for host in hosts:
-        for path in paths:
-            url = host + path
+    urls = [host + path for host in hosts for path in paths]
+
+    def _fetch_one(url: str) -> str:
+        try:
+            return public_fetch_text(url + "?" + urllib.parse.urlencode(params), timeout=MOPS_TIMEOUT_SECONDS)
+        except Exception:
             try:
-                texts.append(public_fetch_text(url + "?" + urllib.parse.urlencode(params), timeout=MOPS_TIMEOUT_SECONDS))
+                return public_fetch_text(url, data=params, timeout=MOPS_TIMEOUT_SECONDS)
             except Exception:
-                try:
-                    texts.append(public_fetch_text(url, data=params, timeout=MOPS_TIMEOUT_SECONDS))
-                except Exception:
-                    continue
-    return "\n".join(texts)
+                return ""
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(urls)) as ex:
+        results = list(ex.map(_fetch_one, urls))
+    return "\n".join(r for r in results if r)
 
 
 def mops_follow_detail_links(text: str) -> str:
@@ -563,7 +570,7 @@ def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keywor
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     dates: list[dt.date] = []
-    for date_value in (received, end, received + dt.timedelta(days=31), received - dt.timedelta(days=31)):
+    for date_value in (received, end):
         if date_value not in dates:
             dates.append(date_value)
     texts: list[str] = []
@@ -577,20 +584,12 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
             "year": f"{roc_year(date_value):03d}",
             "month": f"{date_value.month:02d}",
         }
-        for query_text in (
-            mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params),
-            mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), params),
-        ):
-            texts.append(query_text)
-            texts.append(mops_follow_detail_links(query_text))
+        texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
         keyword_params = dict(params)
         keyword_params["keyWord"] = "轉換公司債" if record.get("分類") in ("CB", "ECB", "EB") else "現金增資"
-        keyword_text = mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params)
-        texts.append(keyword_text)
-        texts.append(mops_follow_detail_links(keyword_text))
+        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params))
         if record.get("分類") in ("CB", "ECB", "EB"):
             texts.append(mops_subject_search_text(record, date_value, "轉換公司債"))
-            texts.append(mops_subject_search_text(record, date_value, "公司債"))
         else:
             texts.append(mops_subject_search_text(record, date_value, "現金增資"))
         if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
@@ -1198,13 +1197,22 @@ def online_mops_lookup(record: dict[str, str], end: dt.date, need_company_short:
         if short_name:
             result["company_short"] = short_name
             record["顯示名稱"] = short_name
+
+    # Fetch the base MOPS text once, reuse for both bond name and purpose
+    lookup_text = ""
+    if need_bond_name or need_purpose:
+        lookup_text = mops_official_lookup_text(record, end, include_bond=need_bond_name)
+
     if need_bond_name:
-        name = mops_bond_short_name(record, end, short_name)
+        name = parse_bond_short_from_text(lookup_text, record, short_name) or parse_bond_short_from_announcement(lookup_text, record, short_name)
         if name:
             result["bond_name"] = name
             record["顯示名稱"] = name
+
     if need_purpose:
-        purpose = mops_funding_purpose(record, end)
+        purpose = parse_purpose_from_text(matching_record_text(lookup_text, record))
+        if not purpose:
+            purpose = funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
         if purpose:
             result["purpose"] = purpose
     return result
@@ -3173,7 +3181,7 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 _fail_job(job_id, str(exc))
 
-        _threading.Timer(300, lambda: _fail_job(job_id, "產出超時（5 分鐘），MOPS 查詢可能無回應，請重試。") if get_job(job_id) and get_job(job_id).get("status") == "running" else None).start()
+        _threading.Timer(600, lambda: _fail_job(job_id, "產出超時（10 分鐘），MOPS 查詢可能無回應，請重試。") if get_job(job_id) and get_job(job_id).get("status") == "running" else None).start()
 
         _threading.Thread(target=_run, daemon=True).start()
         self.send_json(202, {"jobId": job_id})
