@@ -2650,6 +2650,39 @@ def group_for_email(records: list[dict[str, str]]) -> list[str]:
     return lines
 
 
+# ---------------------------------------------------------------------------
+# Async job store — keeps report jobs in memory so Render's 30s HTTP timeout
+# doesn't kill the generation mid-flight.
+# ---------------------------------------------------------------------------
+import threading as _threading
+import uuid as _uuid
+
+_JOBS: dict[str, dict[str, object]] = {}
+_JOBS_LOCK = _threading.Lock()
+
+
+def _create_job() -> str:
+    job_id = _uuid.uuid4().hex
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"status": "running"}
+    return job_id
+
+
+def _finish_job(job_id: str, result: dict[str, object]) -> None:
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"status": "done", **result}
+
+
+def _fail_job(job_id: str, error: str) -> None:
+    with _JOBS_LOCK:
+        _JOBS[job_id] = {"status": "error", "error": error}
+
+
+def get_job(job_id: str) -> dict[str, object] | None:
+    with _JOBS_LOCK:
+        return _JOBS.get(job_id)
+
+
 def week_from_records(records: list[dict[str, str]]) -> tuple[dt.date, dt.date]:
     """Derive Mon-Fri window from the latest 收文日期 in the source file."""
     latest: dt.date | None = None
@@ -2921,7 +2954,6 @@ HTML = """<!doctype html>
         uploadBtn.disabled = true;
         metrics.hidden = true;
         emailBox.value = "";
-        // Animated status while waiting
         const steps = [
           "上傳檔案中…",
           "篩選案件中…",
@@ -2937,31 +2969,44 @@ HTML = """<!doctype html>
           setStatus(steps[stepIdx]);
         }, 8000);
         try {
+          // POST to start job — returns immediately with jobId
           const form = new FormData();
           form.append("source", file);
-          const res = await fetch(`/api/generate-upload`, { method: "POST", body: form });
-          const responseText = await res.text();
-          let data = {};
-          try {
-            data = responseText ? JSON.parse(responseText) : {};
-          } catch (parseErr) {
-            throw new Error(responseText.slice(0, 300) || "伺服器回傳格式錯誤，請看 Render Logs。");
-          }
+          const startRes = await fetch(`/api/generate-upload`, { method: "POST", body: form });
+          const startText = await startRes.text();
+          let startData = {};
+          try { startData = startText ? JSON.parse(startText) : {}; } catch {}
+          if (!startRes.ok) throw new Error(startData.error || "上傳失敗");
+          const jobId = startData.jobId;
+          if (!jobId) throw new Error("伺服器未回傳 jobId");
+
+          // Poll until done or error (no HTTP timeout risk)
+          const data = await new Promise((resolve, reject) => {
+            const poll = setInterval(async () => {
+              try {
+                const r = await fetch(`/api/job/${jobId}`);
+                const d = await r.json();
+                if (d.status === "done") { clearInterval(poll); resolve(d); }
+                else if (d.status === "error") { clearInterval(poll); reject(new Error(d.error || "產出失敗")); }
+                // status === "running" → keep polling
+              } catch (e) { clearInterval(poll); reject(e); }
+            }, 3000);
+          });
+
           clearInterval(stepTimer);
-          if (!res.ok) throw new Error(data.error || "產出失敗");
-        renderMetrics(data.counts);
-        emailBox.value = data.email || "";
-        const warnings = (data.lookupWarnings || []).length
-          ? `\n\nMOPS 待確認：\n${data.lookupWarnings.join("\n")}`
-          : "";
-        setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
-        await loadReports();
-      } catch (err) {
-        clearInterval(stepTimer);
-        setStatus(err.message, true);
-      } finally {
-        uploadBtn.disabled = false;
-      }
+          renderMetrics(data.counts);
+          emailBox.value = data.email || "";
+          const warnings = (data.lookupWarnings || []).length
+            ? `\n\nMOPS 待確認：\n${data.lookupWarnings.join("\n")}`
+            : "";
+          setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
+          await loadReports();
+        } catch (err) {
+          clearInterval(stepTimer);
+          setStatus(err.message, true);
+        } finally {
+          uploadBtn.disabled = false;
+        }
     }
 
     document.addEventListener("DOMContentLoaded", () => {
@@ -3021,6 +3066,14 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/reports":
             self.send_json(200, {"reports": list_reports()})
             return
+        if parsed.path.startswith("/api/job/"):
+            job_id = parsed.path.removeprefix("/api/job/")
+            job = get_job(job_id)
+            if job is None:
+                self.send_json(404, {"error": "job not found"})
+            else:
+                self.send_json(200, job)
+            return
         if parsed.path == "/api/diagnostics":
             self.send_json(200, {"results": run_download_diagnostics()})
             return
@@ -3059,20 +3112,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(500, {"error": str(exc)})
 
     def handle_upload_generate(self, parsed: urllib.parse.ParseResult) -> None:
-        accept = self.headers.get("Accept", "")
-        wants_html = "text/html" in accept and "application/json" not in accept
         try:
             source_path, fields = self.save_uploaded_xlsx()
-            result = build_report(source_path, "uploaded")
-            if wants_html:
-                self.send_result_html(200, result)
-            else:
-                self.send_json(200, result)
         except Exception as exc:
-            if wants_html:
-                self.send_result_html(500, {"error": str(exc)})
-            else:
-                self.send_json(500, {"error": str(exc)})
+            self.send_json(400, {"error": str(exc)})
+            return
+        job_id = _create_job()
+
+        def _run() -> None:
+            try:
+                result = build_report(source_path, "uploaded")
+                _finish_job(job_id, result)
+            except Exception as exc:
+                _fail_job(job_id, str(exc))
+
+        _threading.Thread(target=_run, daemon=True).start()
+        self.send_json(202, {"jobId": job_id})
 
     def send_result_html(self, status: int, payload: dict[str, object]) -> None:
         if "error" in payload:
