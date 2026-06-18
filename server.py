@@ -3173,6 +3173,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 _fail_job(job_id, str(exc))
 
+        _threading.Timer(300, lambda: _fail_job(job_id, "產出超時（5 分鐘），MOPS 查詢可能無回應，請重試。") if get_job(job_id) and get_job(job_id).get("status") == "running" else None).start()
+
         _threading.Thread(target=_run, daemon=True).start()
         self.send_json(202, {"jobId": job_id})
 

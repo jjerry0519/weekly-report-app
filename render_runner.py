@@ -41,7 +41,6 @@ def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keywor
         }
         query_text = server.mops_query_text(("/mops/web/ajax_t51sb10", "/mops/web/t51sb10"), params)
         texts.append(query_text)
-        texts.append(server.mops_follow_detail_links(query_text))
     return "\n".join(text for text in texts if text)
 
 
