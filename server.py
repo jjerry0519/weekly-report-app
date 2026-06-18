@@ -326,19 +326,19 @@ _load_bond_cache()
 
 
 def public_fetch_text(url: str, data: dict[str, str] | None = None, timeout: int = MOPS_TIMEOUT_SECONDS) -> str:
-    encoded = None
+    import requests as _requests
     headers = {
         "User-Agent": "Mozilla/5.0",
         "Referer": "https://mopsov.twse.com.tw/mops/web/index",
     }
-    if data is not None:
-        encoded = urllib.parse.urlencode(data).encode("utf-8")
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-    req = urllib.request.Request(url, data=encoded, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read()
-            charset = resp.headers.get_content_charset() or "utf-8"
+        if data is not None:
+            resp = _requests.post(url, data=data, headers=headers, timeout=timeout)
+        else:
+            resp = _requests.get(url, headers=headers, timeout=timeout)
+        resp.raise_for_status()
+        raw = resp.content
+        charset = resp.encoding or "utf-8"
     except Exception:
         if data is not None:
             raise
