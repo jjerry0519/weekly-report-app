@@ -2861,7 +2861,7 @@ HTML = """<!doctype html>
     </section>
     <section>
       <h2>已產出檔案</h2>
-      <div id="reportList" class="empty">讀取中...</div>
+      <div id="reportList" class="empty">尚未產出，上傳檔案後按「產出」即可。</div>
     </section>
   </div></main>
   <script>
@@ -2979,9 +2979,8 @@ HTML = """<!doctype html>
 
       uploadBtn.addEventListener("click", handleUpload);
 
-      loadReports().catch(err => {
-        list.textContent = err.message;
-      });
+      // Don't auto-load on page open — Render free tier cold start causes 5s timeout
+      // The list refreshes automatically after each successful generation.
     });
   </script>
 </body>
