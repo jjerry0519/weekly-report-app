@@ -2981,6 +2981,7 @@ HTML = """<!doctype html>
           const poll = setInterval(async function() {
             try {
               const r = await fetch("/api/job/" + jobId);
+              if (!r.ok) { clearInterval(poll); reject(new Error("工作查詢失敗（" + r.status + "），請重新整理後再試。")); return; }
               const d = await r.json();
               if (d.status === "done") { clearInterval(poll); resolve(d); }
               else if (d.status === "error") { clearInterval(poll); reject(new Error(d.error || "產出失敗")); }
@@ -3102,45 +3103,6 @@ class Handler(BaseHTTPRequestHandler):
 
         _threading.Thread(target=_run, daemon=True).start()
         self.send_json(202, {"jobId": job_id})
-
-    def send_result_html(self, status: int, payload: dict[str, object]) -> None:
-        if "error" in payload:
-            title = "產出失敗"
-            body_html = f"<p class='error'>{html.escape(str(payload.get('error', '產出失敗')))}</p><p><a href='/'>回首頁</a></p>"
-        else:
-            file_name = str(payload.get("file", ""))
-            email_text = str(payload.get("email", ""))
-            range_text = str(payload.get("rocRange", ""))
-            body_html = (
-                f"<p>已產出：{html.escape(file_name)}</p>"
-                f"<p>週期：{html.escape(range_text)}</p>"
-                f"<p><a class='download' href='/download/{urllib.parse.quote(file_name)}'>下載 Excel</a></p>"
-                f"<h2>Email 範本</h2><textarea readonly>{html.escape(email_text)}</textarea>"
-                "<p><a href='/'>回首頁</a></p>"
-            )
-            title = "產出完成"
-        page = f"""<!doctype html>
-<html lang="zh-Hant">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{title}</title>
-  <style>
-    body {{ margin:0; font-family:"Segoe UI","Microsoft JhengHei",sans-serif; color:#172033; background:#f7f8fa; }}
-    main {{ max-width: 920px; margin: 40px auto; padding: 24px; background:#fff; border:1px solid #d9dee8; border-radius:8px; }}
-    .download {{ display:inline-flex; padding:10px 14px; border-radius:6px; background:#12634f; color:#fff; text-decoration:none; font-weight:700; }}
-    textarea {{ width:100%; min-height:260px; border:1px solid #d9dee8; border-radius:8px; padding:12px; font:14px/1.6 Consolas,"Microsoft JhengHei",monospace; }}
-    .error {{ color:#b00020; white-space:pre-wrap; }}
-  </style>
-</head>
-<body><main><h1>{title}</h1>{body_html}</main></body>
-</html>"""
-        body = page.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
 
     def save_uploaded_xlsx(self) -> tuple[Path, dict[str, str]]:
         content_type = self.headers.get("Content-Type", "")
