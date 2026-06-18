@@ -2875,7 +2875,6 @@ HTML = """<!doctype html>
     <p>從證期局公開資料產出每週 Excel，免登入、免付費。</p>
   </div></header>
   <main><div class="wrap">
-    <form id="uploadForm" enctype="multipart/form-data"></form>
     <section>
       <h2>上傳來源檔</h2>
       <p id="status" class="status"></p>
@@ -2883,7 +2882,7 @@ HTML = """<!doctype html>
       <p class="hint">上傳證期局每週下載的「申報案件彙總表」，系統自動以檔案最新收文日期推算當週（週一至週五），標藍當週新增或變動資料。</p>
       <div class="controls">
         <label>證期局年度申報案件 Excel
-          <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls" required>
+          <input id="sourceFile" type="file" accept=".xlsx,.xls">
         </label>
         <button id="uploadBtn" type="button">產出</button>
       </div>
@@ -2898,134 +2897,109 @@ HTML = """<!doctype html>
     </section>
   </div></main>
   <script>
-    let statusEl;
-    let uploadBtn;
-    let sourceFile;
-    let list;
-    let metrics;
-    let emailBox;
+    const statusEl = document.getElementById("status");
+    const uploadBtn = document.getElementById("uploadBtn");
+    const sourceFile = document.getElementById("sourceFile");
+    const list = document.getElementById("reportList");
+    const metrics = document.getElementById("metrics");
+    const emailBox = document.getElementById("emailBox");
 
-    function setStatus(text, isError = false) {
+    function setStatus(text, isError) {
       statusEl.textContent = text;
       statusEl.className = "status" + (isError ? " error" : "");
     }
+
     function renderMetrics(counts) {
       metrics.hidden = false;
       metrics.innerHTML = [
         ["篩選後", counts.all],
         ["本週新增", counts.new],
         ["本週生效", counts.effective],
-        ["補正 / 停止", `${counts.amend} / ${counts.stop}`],
+        ["補正 / 停止", counts.amend + " / " + counts.stop],
         ["待補原因", counts.missingPurpose || 0],
         ["查詢未完成", counts.lookupWarnings || 0],
-      ].map(([label, value]) => `<div class="metric"><span>${label}</span><strong>${value}</strong></div>`).join("");
+      ].map(function(p) {
+        return '<div class="metric"><span>' + p[0] + '</span><strong>' + p[1] + '</strong></div>';
+      }).join("");
     }
 
     async function loadReports() {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 5000);
       try {
-        const res = await fetch("/api/reports", { signal: controller.signal });
+        const res = await fetch("/api/reports");
         const data = await res.json();
-        if (!data.reports.length) {
+        if (!data.reports || !data.reports.length) {
           list.className = "empty";
           list.textContent = "目前還沒有產出檔案。";
           return;
         }
         list.className = "";
-        list.innerHTML = `<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>${
-          data.reports.map(r => `<tr><td>${r.file}</td><td>${r.modified}</td><td><a class="download" href="/download/${encodeURIComponent(r.file)}">下載 Excel</a></td></tr>`).join("")
-        }</tbody></table>`;
-      } catch (err) {
-        list.className = "empty";
-        list.textContent = "檔案清單讀取失敗，請重新整理頁面。";
-      } finally {
-        clearTimeout(timeout);
+        list.innerHTML = '<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>' +
+          data.reports.map(function(r) {
+            return '<tr><td>' + r.file + '</td><td>' + r.modified + '</td><td><a class="download" href="/download/' + encodeURIComponent(r.file) + '">下載 Excel</a></td></tr>';
+          }).join("") + '</tbody></table>';
+      } catch (e) {
+        // silently ignore — list will update after next generation
       }
     }
 
-    async function handleUpload(event) {
-      if (event) event.preventDefault();
+    uploadBtn.addEventListener("click", async function() {
       const file = sourceFile.files[0];
       if (!file) {
         setStatus("請先選擇證期局年度申報案件 Excel。", true);
         return;
       }
-        uploadBtn.disabled = true;
-        metrics.hidden = true;
-        emailBox.value = "";
-        const steps = [
-          "上傳檔案中…",
-          "篩選案件中…",
-          "查詢公開資訊觀測站（CB/ECB 次數）…",
-          "比對本週新增與生效…",
-          "寫入 Excel 欄位中…",
-          "產出郵件範本…",
-        ];
-        let stepIdx = 0;
-        setStatus(steps[0]);
-        const stepTimer = setInterval(() => {
-          stepIdx = Math.min(stepIdx + 1, steps.length - 1);
-          setStatus(steps[stepIdx]);
-        }, 8000);
-        try {
-          // POST to start job — returns immediately with jobId
-          const form = new FormData();
-          form.append("source", file);
-          const startRes = await fetch(`/api/generate-upload`, { method: "POST", body: form });
-          const startText = await startRes.text();
-          let startData = {};
-          try { startData = startText ? JSON.parse(startText) : {}; } catch {}
-          if (!startRes.ok) throw new Error(startData.error || "上傳失敗");
-          const jobId = startData.jobId;
-          if (!jobId) throw new Error("伺服器未回傳 jobId");
 
-          // Poll until done or error (no HTTP timeout risk)
-          const data = await new Promise((resolve, reject) => {
-            const poll = setInterval(async () => {
-              try {
-                const r = await fetch(`/api/job/${jobId}`);
-                const d = await r.json();
-                if (d.status === "done") { clearInterval(poll); resolve(d); }
-                else if (d.status === "error") { clearInterval(poll); reject(new Error(d.error || "產出失敗")); }
-                // status === "running" → keep polling
-              } catch (e) { clearInterval(poll); reject(e); }
-            }, 3000);
-          });
+      uploadBtn.disabled = true;
+      metrics.hidden = true;
+      emailBox.value = "";
 
-          clearInterval(stepTimer);
-          renderMetrics(data.counts);
-          emailBox.value = data.email || "";
-          const warnings = (data.lookupWarnings || []).length
-            ? `\n\nMOPS 待確認：\n${data.lookupWarnings.join("\n")}`
-            : "";
-          setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
-          await loadReports();
-        } catch (err) {
-          clearInterval(stepTimer);
-          setStatus(err.message, true);
-        } finally {
-          uploadBtn.disabled = false;
-        }
-    }
+      const steps = [
+        "上傳檔案中…",
+        "篩選案件中…",
+        "查詢公開資訊觀測站（CB/ECB 次數）…",
+        "比對本週新增與生效…",
+        "寫入 Excel 欄位中…",
+        "產出郵件範本…",
+      ];
+      let stepIdx = 0;
+      setStatus(steps[0]);
+      const stepTimer = setInterval(function() {
+        stepIdx = Math.min(stepIdx + 1, steps.length - 1);
+        setStatus(steps[stepIdx]);
+      }, 8000);
 
-    document.addEventListener("DOMContentLoaded", () => {
-      statusEl = document.querySelector("#status");
-      uploadBtn = document.querySelector("#uploadBtn");
-      sourceFile = document.querySelector("#sourceFile");
-      list = document.querySelector("#reportList");
-      metrics = document.querySelector("#metrics");
-      emailBox = document.querySelector("#emailBox");
+      try {
+        const form = new FormData();
+        form.append("source", file);
+        const startRes = await fetch("/api/generate-upload", { method: "POST", body: form });
+        const startData = await startRes.json();
+        if (!startRes.ok) throw new Error(startData.error || "上傳失敗");
+        const jobId = startData.jobId;
+        if (!jobId) throw new Error("伺服器未回傳 jobId");
 
-      if (!statusEl || !uploadBtn || !sourceFile || !list || !metrics || !emailBox) {
-        document.body.insertAdjacentHTML("afterbegin", "<p style='padding:12px;color:#b00020'>頁面元件載入不完整，請重新整理。</p>");
-        return;
+        const data = await new Promise(function(resolve, reject) {
+          const poll = setInterval(async function() {
+            try {
+              const r = await fetch("/api/job/" + jobId);
+              const d = await r.json();
+              if (d.status === "done") { clearInterval(poll); resolve(d); }
+              else if (d.status === "error") { clearInterval(poll); reject(new Error(d.error || "產出失敗")); }
+            } catch (e) { clearInterval(poll); reject(e); }
+          }, 3000);
+        });
+
+        clearInterval(stepTimer);
+        renderMetrics(data.counts);
+        emailBox.value = data.email || "";
+        const w = (data.lookupWarnings || []).length ? "\n\nMOPS 待確認：\n" + data.lookupWarnings.join("\n") : "";
+        setStatus("已產出：" + data.file + "\n週期：" + data.rocRange + w);
+        await loadReports();
+      } catch (err) {
+        clearInterval(stepTimer);
+        setStatus(err.message, true);
+      } finally {
+        uploadBtn.disabled = false;
       }
-
-      uploadBtn.addEventListener("click", handleUpload);
-
-      // Don't auto-load on page open — Render free tier cold start causes 5s timeout
-      // The list refreshes automatically after each successful generation.
     });
   </script>
 </body>
