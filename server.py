@@ -2829,183 +2829,250 @@ def list_reports() -> list[dict[str, object]]:
     ]
 
 
+
 HTML = """<!doctype html>
 <html lang="zh-Hant">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>同業送件明細下載</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>同業送件明細</title>
   <style>
-    :root { color-scheme: light; --ink:#172033; --muted:#647084; --line:#d9dee8; --brand:#12634f; --soft:#f4f7f6; --warn:#8a4b00; }
-    * { box-sizing: border-box; }
-    body { margin: 0; font-family: "Segoe UI", "Microsoft JhengHei", sans-serif; color: var(--ink); background: #f7f8fa; }
-    header { background: #ffffff; border-bottom: 1px solid var(--line); }
-    .wrap { max-width: 1080px; margin: 0 auto; padding: 24px; }
-    h1 { margin: 0 0 6px; font-size: 28px; font-weight: 700; letter-spacing: 0; }
-    p { margin: 0; color: var(--muted); line-height: 1.7; }
-    main .wrap { display: grid; gap: 18px; }
-    section, .panel { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 18px; }
-    h2 { margin: 0 0 14px; font-size: 18px; }
-    .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
-    label { display: grid; gap: 6px; color: var(--muted); font-size: 14px; }
-    input { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px; font: inherit; color: var(--ink); }
-    button, .download { min-height: 38px; border: 0; border-radius: 6px; padding: 9px 14px; font: inherit; font-weight: 700; cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; justify-content: center; }
-    button { background: var(--brand); color: #fff; }
-    button.secondary { background: #edf3f1; color: var(--brand); }
-    button:disabled { opacity: .6; cursor: wait; }
-    .download { background: #e7f1ee; color: var(--brand); }
-    .status { min-height: 28px; color: var(--muted); white-space: pre-wrap; }
-    .status.error { color: #b00020; }
-    .hint { margin: -4px 0 14px; }
-    a { color: var(--brand); font-weight: 700; }
-    .grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
-    .metric { background: var(--soft); border-radius: 8px; padding: 12px; }
-    .metric strong { display:block; font-size: 24px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; border-bottom: 1px solid var(--line); padding: 10px 8px; vertical-align: middle; }
-    th { font-size: 13px; color: var(--muted); font-weight: 700; }
-    textarea { width: 100%; min-height: 220px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; font: 14px/1.6 Consolas, "Microsoft JhengHei", monospace; resize: vertical; }
-    .empty { color: var(--muted); padding: 10px 0; }
-    @media (max-width: 760px) { .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } .wrap { padding: 16px; } }
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:"Segoe UI","Microsoft JhengHei",sans-serif;background:#f0f2f5;color:#1a2233;min-height:100vh}
+    header{background:#12634f;color:#fff;padding:20px 24px}
+    header h1{font-size:20px;font-weight:700}
+    header p{font-size:13px;opacity:.75;margin-top:4px}
+    .page{max-width:960px;margin:24px auto;padding:0 16px;display:grid;gap:16px}
+    .card{background:#fff;border:1px solid #dde3ee;border-radius:10px;padding:20px}
+    .card h2{font-size:15px;font-weight:700;color:#12634f;margin-bottom:16px}
+    .upload-row{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}
+    .file-label{flex:1;min-width:200px}
+    .file-label span{display:block;font-size:12px;color:#647084;margin-bottom:6px}
+    .file-input{width:100%;padding:8px 10px;border:1.5px dashed #c2cfe0;border-radius:7px;font:inherit;color:#1a2233;cursor:pointer;background:#fafbfc}
+    .file-input:hover{border-color:#12634f;background:#f0f7f4}
+    .btn{padding:10px 22px;border:none;border-radius:7px;font:inherit;font-weight:700;font-size:14px;cursor:pointer;white-space:nowrap}
+    .btn-primary{background:#12634f;color:#fff}
+    .btn-primary:hover{background:#0e4f3f}
+    .btn-primary:disabled{opacity:.55;cursor:not-allowed}
+    .progress{margin-top:14px;display:none}
+    .progress-bar-wrap{height:5px;background:#e8edf4;border-radius:3px;overflow:hidden;margin-bottom:8px}
+    .progress-bar{height:100%;background:#12634f;border-radius:3px;width:0;transition:width .4s ease}
+    .progress-text{font-size:13px;color:#647084}
+    .status-msg{margin-top:10px;font-size:13px;line-height:1.6;white-space:pre-wrap;display:none}
+    .status-msg.ok{color:#0a4a39}
+    .status-msg.err{color:#c0001a}
+    .metrics{display:none;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-top:14px}
+    .metric{background:#f0f7f4;border-radius:8px;padding:12px}
+    .metric strong{display:block;font-size:26px;font-weight:700;color:#12634f}
+    .metric span{font-size:12px;color:#647084;margin-top:2px;display:block}
+    textarea{width:100%;min-height:180px;border:1.5px solid #dde3ee;border-radius:7px;padding:10px;font:13px/1.6 Consolas,"Microsoft JhengHei",monospace;resize:vertical;color:#1a2233}
+    .file-list{display:none}
+    table{width:100%;border-collapse:collapse}
+    th{font-size:12px;color:#647084;text-align:left;padding:6px 8px;border-bottom:1px solid #dde3ee}
+    td{padding:8px;border-bottom:1px solid #f0f2f5;font-size:13px;vertical-align:middle}
+    .dl-btn{display:inline-flex;padding:5px 12px;background:#e8f4f0;color:#12634f;border-radius:5px;font-size:12px;font-weight:700;text-decoration:none}
+    .dl-btn:hover{background:#c9e8df}
+    .empty-note{font-size:13px;color:#647084;padding:4px 0}
   </style>
 </head>
 <body>
-  <header><div class="wrap">
-    <h1>同業送件明細下載</h1>
-    <p>從證期局公開資料產出每週 Excel，免登入、免付費。</p>
-  </div></header>
-  <main><div class="wrap">
-    <section>
-      <h2>上傳來源檔</h2>
-      <p id="status" class="status"></p>
-      <div id="metrics" class="grid" hidden></div>
-      <p class="hint">上傳證期局每週下載的「申報案件彙總表」，系統自動以檔案最新收文日期推算當週（週一至週五），標藍當週新增或變動資料。</p>
-      <div class="controls">
-        <label>證期局年度申報案件 Excel
-          <input id="sourceFile" type="file" accept=".xlsx,.xls">
-        </label>
-        <button id="uploadBtn" type="button">產出</button>
+<header>
+  <h1>同業送件明細</h1>
+  <p>上傳證期局申報案件彙總表，自動產出每週 Excel 與 Email 範本</p>
+</header>
+<div class="page">
+  <div class="card">
+    <h2>上傳來源檔</h2>
+    <div class="upload-row">
+      <div class="file-label">
+        <span>證期局年度申報案件 Excel（.xlsx）</span>
+        <input id="fileInput" class="file-input" type="file" accept=".xlsx,.xls">
       </div>
-    </section>
-    <section>
-      <h2>Email 範本</h2>
-      <textarea id="emailBox" readonly placeholder="產出後會顯示可貼到 Email 的文字"></textarea>
-    </section>
-    <section>
-      <h2>已產出檔案</h2>
-      <div id="reportList" class="empty">尚未產出，上傳檔案後按「產出」即可。</div>
-    </section>
-  </div></main>
-  <script>
-    const statusEl = document.getElementById("status");
-    const uploadBtn = document.getElementById("uploadBtn");
-    const sourceFile = document.getElementById("sourceFile");
-    const list = document.getElementById("reportList");
-    const metrics = document.getElementById("metrics");
-    const emailBox = document.getElementById("emailBox");
+      <button id="genBtn" class="btn btn-primary" type="button">產出</button>
+    </div>
+    <div class="progress" id="progressWrap">
+      <div class="progress-bar-wrap"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="progress-text" id="progressText">準備中…</div>
+    </div>
+    <div class="status-msg" id="statusMsg"></div>
+    <div class="metrics" id="metrics">
+      <div class="metric"><strong id="m-all">-</strong><span>篩選後總筆數</span></div>
+      <div class="metric"><strong id="m-new">-</strong><span>本週新增</span></div>
+      <div class="metric"><strong id="m-eff">-</strong><span>本週生效</span></div>
+      <div class="metric"><strong id="m-amd">-</strong><span>補正／停止</span></div>
+    </div>
+  </div>
+  <div class="card">
+    <h2>Email 範本</h2>
+    <textarea id="emailBox" readonly placeholder="產出完成後自動填入"></textarea>
+  </div>
+  <div class="card">
+    <h2>已產出檔案</h2>
+    <div class="empty-note" id="emptyNote">尚未產出，上傳後按「產出」即可。</div>
+    <div class="file-list" id="fileList">
+      <table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead>
+      <tbody id="fileRows"></tbody></table>
+    </div>
+  </div>
+</div>
+<script>
+(function() {
+  var fileInput    = document.getElementById("fileInput");
+  var genBtn       = document.getElementById("genBtn");
+  var progressWrap = document.getElementById("progressWrap");
+  var progressBar  = document.getElementById("progressBar");
+  var progressText = document.getElementById("progressText");
+  var statusMsg    = document.getElementById("statusMsg");
+  var metricsEl    = document.getElementById("metrics");
+  var emailBox     = document.getElementById("emailBox");
+  var emptyNote    = document.getElementById("emptyNote");
+  var fileListEl   = document.getElementById("fileList");
+  var fileRows     = document.getElementById("fileRows");
 
-    function setStatus(text, isError) {
-      statusEl.textContent = text;
-      statusEl.className = "status" + (isError ? " error" : "");
-    }
+  var STEPS = [
+    [5,  "上傳檔案中…"],
+    [20, "篩選案件中…"],
+    [40, "查詢公開資訊觀測站（CB/ECB 次數）…"],
+    [65, "比對本週新增與生效…"],
+    [80, "寫入 Excel 欄位中…"],
+    [92, "產出郵件範本…"],
+  ];
+  var stepIdx = 0;
+  var stepTimer = null;
 
-    function renderMetrics(counts) {
-      metrics.hidden = false;
-      metrics.innerHTML = [
-        ["篩選後", counts.all],
-        ["本週新增", counts.new],
-        ["本週生效", counts.effective],
-        ["補正 / 停止", counts.amend + " / " + counts.stop],
-        ["待補原因", counts.missingPurpose || 0],
-        ["查詢未完成", counts.lookupWarnings || 0],
-      ].map(function(p) {
-        return '<div class="metric"><span>' + p[0] + '</span><strong>' + p[1] + '</strong></div>';
-      }).join("");
-    }
+  function startProgress() {
+    stepIdx = 0;
+    progressWrap.style.display = "block";
+    progressBar.style.width = STEPS[0][0] + "%";
+    progressText.textContent = STEPS[0][1];
+    clearInterval(stepTimer);
+    stepTimer = setInterval(function() {
+      stepIdx = Math.min(stepIdx + 1, STEPS.length - 1);
+      progressBar.style.width = STEPS[stepIdx][0] + "%";
+      progressText.textContent = STEPS[stepIdx][1];
+    }, 8000);
+  }
 
-    async function loadReports() {
-      try {
-        const res = await fetch("/api/reports");
-        const data = await res.json();
-        if (!data.reports || !data.reports.length) {
-          list.className = "empty";
-          list.textContent = "目前還沒有產出檔案。";
+  function stopProgress(ok) {
+    clearInterval(stepTimer);
+    stepTimer = null;
+    progressBar.style.width = ok ? "100%" : "0%";
+    progressText.textContent = ok ? "完成！" : "";
+  }
+
+  function showStatus(msg, isErr) {
+    statusMsg.textContent = msg;
+    statusMsg.className = "status-msg " + (isErr ? "err" : "ok");
+    statusMsg.style.display = "block";
+  }
+
+  function showMetrics(c) {
+    document.getElementById("m-all").textContent = c.all;
+    document.getElementById("m-new").textContent = c.new;
+    document.getElementById("m-eff").textContent = c.effective;
+    document.getElementById("m-amd").textContent = (c.amend || 0) + "/" + (c.stop || 0);
+    metricsEl.style.display = "grid";
+  }
+
+  function refreshFiles() {
+    fetch("/api/reports")
+      .then(function(r) { return r.json(); })
+      .then(function(d) {
+        var reps = d.reports || [];
+        if (!reps.length) {
+          emptyNote.style.display = "block";
+          fileListEl.style.display = "none";
           return;
         }
-        list.className = "";
-        list.innerHTML = '<table><thead><tr><th>檔名</th><th>時間</th><th></th></tr></thead><tbody>' +
-          data.reports.map(function(r) {
-            return '<tr><td>' + r.file + '</td><td>' + r.modified + '</td><td><a class="download" href="/download/' + encodeURIComponent(r.file) + '">下載 Excel</a></td></tr>';
-          }).join("") + '</tbody></table>';
-      } catch (e) {
-        // silently ignore — list will update after next generation
-      }
+        emptyNote.style.display = "none";
+        fileListEl.style.display = "block";
+        fileRows.innerHTML = reps.map(function(r) {
+          return "<tr><td>" + r.file + "</td><td>" + r.modified +
+            "</td><td><a class=\"dl-btn\" href=\"/download/" +
+            encodeURIComponent(r.file) + "\">下載</a></td></tr>";
+        }).join("");
+      })
+      .catch(function() {});
+  }
+
+  genBtn.addEventListener("click", function() {
+    var file = fileInput.files[0];
+    if (!file) {
+      showStatus("請先選擇 Excel 檔案。", true);
+      return;
     }
 
-    uploadBtn.addEventListener("click", async function() {
-      const file = sourceFile.files[0];
-      if (!file) {
-        setStatus("請先選擇證期局年度申報案件 Excel。", true);
-        return;
-      }
+    genBtn.disabled = true;
+    metricsEl.style.display = "none";
+    emailBox.value = "";
+    statusMsg.style.display = "none";
+    startProgress();
 
-      uploadBtn.disabled = true;
-      metrics.hidden = true;
-      emailBox.value = "";
+    var form = new FormData();
+    form.append("source", file);
 
-      const steps = [
-        "上傳檔案中…",
-        "篩選案件中…",
-        "查詢公開資訊觀測站（CB/ECB 次數）…",
-        "比對本週新增與生效…",
-        "寫入 Excel 欄位中…",
-        "產出郵件範本…",
-      ];
-      let stepIdx = 0;
-      setStatus(steps[0]);
-      const stepTimer = setInterval(function() {
-        stepIdx = Math.min(stepIdx + 1, steps.length - 1);
-        setStatus(steps[stepIdx]);
-      }, 8000);
-
-      try {
-        const form = new FormData();
-        form.append("source", file);
-        const startRes = await fetch("/api/generate-upload", { method: "POST", body: form });
-        const startData = await startRes.json();
-        if (!startRes.ok) throw new Error(startData.error || "上傳失敗");
-        const jobId = startData.jobId;
-        if (!jobId) throw new Error("伺服器未回傳 jobId");
-
-        const data = await new Promise(function(resolve, reject) {
-          const poll = setInterval(async function() {
-            try {
-              const r = await fetch("/api/job/" + jobId);
-              if (!r.ok) { clearInterval(poll); reject(new Error("工作查詢失敗（" + r.status + "），請重新整理後再試。")); return; }
-              const d = await r.json();
-              if (d.status === "done") { clearInterval(poll); resolve(d); }
-              else if (d.status === "error") { clearInterval(poll); reject(new Error(d.error || "產出失敗")); }
-            } catch (e) { clearInterval(poll); reject(e); }
-          }, 3000);
+    fetch("/api/generate-upload", { method: "POST", body: form })
+      .then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) { throw new Error(d.error || "上傳失敗 (" + r.status + ")"); }
+          return d;
         });
+      })
+      .then(function(d) {
+        var jobId = d.jobId;
+        if (!jobId) { throw new Error("伺服器未回傳 jobId"); }
 
-        clearInterval(stepTimer);
-        renderMetrics(data.counts);
-        emailBox.value = data.email || "";
-        const w = (data.lookupWarnings || []).length ? "\n\nMOPS 待確認：\n" + data.lookupWarnings.join("\n") : "";
-        setStatus("已產出：" + data.file + "\n週期：" + data.rocRange + w);
-        await loadReports();
-      } catch (err) {
-        clearInterval(stepTimer);
-        setStatus(err.message, true);
-      } finally {
-        uploadBtn.disabled = false;
-      }
-    });
-  </script>
+        var pollTimer = setInterval(function() {
+          fetch("/api/job/" + jobId)
+            .then(function(r) {
+              return r.json().then(function(j) { return { ok: r.ok, j: j }; });
+            })
+            .then(function(x) {
+              if (!x.ok) {
+                clearInterval(pollTimer);
+                stopProgress(false);
+                showStatus("查詢失敗，請重新整理後再試。", true);
+                genBtn.disabled = false;
+                return;
+              }
+              var j = x.j;
+              if (j.status === "done") {
+                clearInterval(pollTimer);
+                stopProgress(true);
+                showMetrics(j.counts);
+                emailBox.value = j.email || "";
+                var warns = (j.lookupWarnings || []);
+                var w = warns.length ? "\n\nMOPS 待確認：\n" + warns.join("\n") : "";
+                showStatus("已產出：" + j.file + "\n週期：" + j.rocRange + w, false);
+                refreshFiles();
+                genBtn.disabled = false;
+              } else if (j.status === "error") {
+                clearInterval(pollTimer);
+                stopProgress(false);
+                showStatus(j.error || "產出失敗", true);
+                genBtn.disabled = false;
+              }
+            })
+            .catch(function(e) {
+              clearInterval(pollTimer);
+              stopProgress(false);
+              showStatus(e.message, true);
+              genBtn.disabled = false;
+            });
+        }, 3000);
+      })
+      .catch(function(e) {
+        stopProgress(false);
+        showStatus(e.message, true);
+        genBtn.disabled = false;
+      });
+  });
+})();
+</script>
 </body>
 </html>
 """
+
 
 
 class Handler(BaseHTTPRequestHandler):
