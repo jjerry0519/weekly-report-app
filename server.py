@@ -3022,7 +3022,7 @@ HTML = """<!doctype html>
         return;
       }
 
-      uploadBtn.addEventListener("click", handleUpload);
+      document.getElementById("uploadForm").addEventListener("submit", handleUpload);
 
       // Don't auto-load on page open — Render free tier cold start causes 5s timeout
       // The list refreshes automatically after each successful generation.
