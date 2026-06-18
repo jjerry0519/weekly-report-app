@@ -34,7 +34,7 @@ TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_PATH = TEMPLATE_DIR / "同業送件明細樣板.xlsx"
 SFB_PAGE = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
 ENABLE_ONLINE_MOPS_LOOKUP = os.environ.get("ENABLE_ONLINE_MOPS_LOOKUP", "1").lower() in {"1", "true", "yes", "on"}
-MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "6"))
+MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "10"))
 
 COMPANY_TYPES = ("上市", "上櫃")
 CASE_KEYWORDS = (
@@ -273,7 +273,7 @@ BOND_SHORT_NAMES = {
     ("8299", "ECB", "800000000"): "群聯海外一",
 }
 
-MOPS_TIMEOUT_SECONDS = 4
+MOPS_TIMEOUT_SECONDS = 2
 
 # Hard-coded seed entries (bootstraps the cache on first deploy)
 MOPS_ENRICHMENTS: dict[tuple[str, str, str], dict[str, str]] = {
@@ -1234,6 +1234,11 @@ def enrich_records(
             record["顯示名稱"] = data["display"]
             record["本次籌資計畫"] = data["purpose"]
         if focus_keys is not None and record_key(record) not in focus_keys:
+            continue
+        # If cache already has a display name and we don't need fresh purpose, skip MOPS.
+        if data and data.get("display") and not wants_fresh_purpose:
+            record["顯示名稱"] = data["display"]
+            record["本次籌資計畫"] = data.get("purpose", record.get("本次籌資計畫", ""))
             continue
         need_company_short = True
         need_bond_name = record.get("分類") in ("CB", "ECB", "EB")

@@ -52,19 +52,15 @@ def patched_mops_official_lookup_text(record: dict[str, str], end: dt.date, incl
     texts = [_original_lookup(record, end, include_bond=include_bond)]
     received = server.parse_date(record.get("收文日期", "")) or end
     dates: list[dt.date] = []
-    for date_value in (received, end, received + dt.timedelta(days=31), received - dt.timedelta(days=31)):
+    for date_value in (received, end):
         if date_value not in dates:
             dates.append(date_value)
 
     classification = record.get("分類")
-    if classification in ("CB", "ECB", "EB"):
-        keywords = ("轉換公司債", "公司債", "發行")
-    else:
-        keywords = ("現金增資", "資金用途")
+    keyword = "轉換公司債" if classification in ("CB", "ECB", "EB") else "現金增資"
 
     for date_value in dates:
-        for keyword in keywords:
-            texts.append(mops_subject_search_text(record, date_value, keyword))
+        texts.append(mops_subject_search_text(record, date_value, keyword))
     return "\n".join(text for text in texts if text)
 
 
