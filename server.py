@@ -2921,7 +2921,21 @@ HTML = """<!doctype html>
         uploadBtn.disabled = true;
         metrics.hidden = true;
         emailBox.value = "";
-        setStatus("正在產出 Excel...");
+        // Animated status while waiting
+        const steps = [
+          "上傳檔案中…",
+          "篩選案件中…",
+          "查詢公開資訊觀測站（CB/ECB 次數）…",
+          "比對本週新增與生效…",
+          "寫入 Excel 欄位中…",
+          "產出郵件範本…",
+        ];
+        let stepIdx = 0;
+        setStatus(steps[0]);
+        const stepTimer = setInterval(() => {
+          stepIdx = Math.min(stepIdx + 1, steps.length - 1);
+          setStatus(steps[stepIdx]);
+        }, 8000);
         try {
           const form = new FormData();
           form.append("source", file);
@@ -2933,6 +2947,7 @@ HTML = """<!doctype html>
           } catch (parseErr) {
             throw new Error(responseText.slice(0, 300) || "伺服器回傳格式錯誤，請看 Render Logs。");
           }
+          clearInterval(stepTimer);
           if (!res.ok) throw new Error(data.error || "產出失敗");
         renderMetrics(data.counts);
         emailBox.value = data.email || "";
@@ -2942,6 +2957,7 @@ HTML = """<!doctype html>
         setStatus(`已產出：${data.file}\n週期：${data.rocRange}${warnings}`);
         await loadReports();
       } catch (err) {
+        clearInterval(stepTimer);
         setStatus(err.message, true);
       } finally {
         uploadBtn.disabled = false;
