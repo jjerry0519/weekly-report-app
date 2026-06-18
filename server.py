@@ -2875,7 +2875,7 @@ HTML = """<!doctype html>
     <p>從證期局公開資料產出每週 Excel，免登入、免付費。</p>
   </div></header>
   <main><div class="wrap">
-    <form id="uploadForm" method="post" action="/api/generate-upload" enctype="multipart/form-data"></form>
+    <form id="uploadForm" enctype="multipart/form-data"></form>
     <section>
       <h2>上傳來源檔</h2>
       <p id="status" class="status"></p>
@@ -2885,7 +2885,7 @@ HTML = """<!doctype html>
         <label>證期局年度申報案件 Excel
           <input id="sourceFile" name="source" form="uploadForm" type="file" accept=".xlsx,.xls" required>
         </label>
-        <button id="uploadBtn" form="uploadForm" type="submit">產出</button>
+        <button id="uploadBtn" type="button">產出</button>
       </div>
     </section>
     <section>
@@ -3022,7 +3022,7 @@ HTML = """<!doctype html>
         return;
       }
 
-      document.getElementById("uploadForm").addEventListener("submit", handleUpload);
+      uploadBtn.addEventListener("click", handleUpload);
 
       // Don't auto-load on page open — Render free tier cold start causes 5s timeout
       // The list refreshes automatically after each successful generation.
