@@ -376,13 +376,10 @@ def _bulk_load_company_names() -> None:
     sources = (
         ("json", "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"),
         ("json", "https://openapi.twse.com.tw/v1/opendata/t187ap03_O"),
-        ("json", "https://www.tpex.org.tw/openapi/v1/t187ap03_O"),
-        ("csv",  "https://dts.twse.com.tw/opendata/t187ap03_L.csv"),
-        ("csv",  "https://dts.twse.com.tw/opendata/t187ap03_O.csv"),
     )
     for fmt, url in sources:
         try:
-            text = public_fetch_text(url, timeout=8)
+            text = public_fetch_text(url, timeout=5)
             if fmt == "json":
                 rows = json.loads(text)
                 if not isinstance(rows, list):
@@ -569,35 +566,29 @@ def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keywor
 
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
-    dates: list[dt.date] = []
-    for date_value in (received, end):
-        if date_value not in dates:
-            dates.append(date_value)
+    co_id = record.get("證券代號", "")
+    classification = record.get("分類", "")
     texts: list[str] = []
-    for date_value in dates:
-        params = {
-            "encodeURIComponent": "1",
-            "step": "1",
-            "firstin": "1",
-            "TYPEK": "all",
-            "co_id": record.get("證券代號", ""),
-            "year": f"{roc_year(date_value):03d}",
-            "month": f"{date_value.month:02d}",
-        }
-        texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
-        keyword_params = dict(params)
-        keyword_params["keyWord"] = "轉換公司債" if record.get("分類") in ("CB", "ECB", "EB") else "現金增資"
-        texts.append(mops_query_text(("/mops/web/ajax_t05st01", "/mops/web/t05st01"), keyword_params))
-        if record.get("分類") in ("CB", "ECB", "EB"):
-            texts.append(mops_subject_search_text(record, date_value, "轉換公司債"))
-        else:
-            texts.append(mops_subject_search_text(record, date_value, "現金增資"))
-        if include_bond and record.get("分類") in ("CB", "ECB", "EB"):
-            bond_params = dict(params)
-            bond_params["TYPEK"] = ""
-            bond_params["bond_kind"] = "5,7"
-            texts.append(mops_query_text(("/mops/web/ajax_t120sb02", "/mops/web/t120sb02"), bond_params))
-    texts.append(mops_major_announcement_text(record, end))
+
+    # Primary: announcement list for received month (single call, 4 parallel requests)
+    params = {
+        "encodeURIComponent": "1",
+        "step": "1",
+        "firstin": "1",
+        "TYPEK": "all",
+        "co_id": co_id,
+        "year": f"{roc_year(received):03d}",
+        "month": f"{received.month:02d}",
+    }
+    texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params))
+
+    # If received and end are different months, also query end month
+    if (roc_year(end), end.month) != (roc_year(received), received.month):
+        end_params = dict(params)
+        end_params["year"] = f"{roc_year(end):03d}"
+        end_params["month"] = f"{end.month:02d}"
+        texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), end_params))
+
     texts.append(open_data_major_announcement_text(record))
     return "\n".join(text for text in texts if text)
 
