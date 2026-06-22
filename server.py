@@ -41,7 +41,7 @@ CASE_KEYWORDS = (
     "現金增資",
     "轉換公司債",
     "交換公司債",
-    "海外存託憑證",
+    "存託憑證",
 )
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -237,7 +237,7 @@ def row_value(row: dict[str, str], header: dict[str, str], name: str) -> str:
 
 def case_code(case_type: str) -> str:
     text = normalize_header(case_type)
-    if "海外存託憑證" in text:
+    if "存託憑證" in text:  # 涵蓋「海外存託憑證」與「存託憑證(海外)」兩種寫法
         return "GDR"
     if "交換公司債" in text:
         return "EB"
@@ -1459,6 +1459,15 @@ def clean_broker(value: str) -> str:
     return re.sub(r"\s+", "", value).strip("、,，")
 
 
+def normalize_broker(value: str) -> str:
+    """正規化承銷商名供比對：源檔帶『證券』，樣板常用簡稱（永豐金證、第一金證）。
+    去掉結尾的『證券』再去掉單一『證』或『券』，讓兩邊核心名對齊。"""
+    name = clean_broker(value)
+    name = re.sub(r"證券$", "", name)
+    name = re.sub(r"[證券]$", "", name)
+    return name
+
+
 def in_range(value: str, start: dt.date, end: dt.date) -> bool:
     parsed = parse_date(value)
     return bool(parsed and start <= parsed <= end)
@@ -2673,7 +2682,7 @@ def update_summary_sheet_openpyxl(
     sheet["AX2"] = f"{roc_year(end)}.01.01~{roc_date(end)}"
     broker_rows: dict[str, int] = {}
     for row_num in range(4, sheet.max_row + 1):
-        broker = clean_broker(str(sheet.cell(row_num, 1).value or ""))
+        broker = normalize_broker(str(sheet.cell(row_num, 1).value or ""))
         if broker:
             broker_rows[broker] = row_num
 
@@ -2681,7 +2690,7 @@ def update_summary_sheet_openpyxl(
     by_broker: dict[str, dict[str, list[str]]] = {}
     weekly_by_broker: dict[str, dict[str, list[str]]] = {}
     for record in year_records:
-        broker = clean_broker(record.get("承銷商", "")) or "未填"
+        broker = normalize_broker(record.get("承銷商", "")) or "未填"
         code = record.get("分類", "其他")
         if code not in OPENPYXL_SUMMARY_COLUMNS:
             continue
@@ -2694,7 +2703,7 @@ def update_summary_sheet_openpyxl(
                 continue
         elif not weekly_blue_columns(record, start, end):
             continue
-        broker = clean_broker(record.get("承銷商", "")) or "未填"
+        broker = normalize_broker(record.get("承銷商", "")) or "未填"
         code = record.get("分類", "其他")
         if code not in OPENPYXL_SUMMARY_COLUMNS:
             continue
