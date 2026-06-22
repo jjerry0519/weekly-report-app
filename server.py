@@ -1434,16 +1434,20 @@ def enrich_records(
             # 清掉可能半殘的快取，強制重抓完整 detail
             received = parse_date(record.get("收文日期", "")) or end
             _RESOLUTION_CACHE.pop((record.get("證券代號", ""), record.get("分類", ""), received.year, received.month), None)
+            code = record.get("證券代號", "")
             if need_bond:
                 name = mops_bond_short_name_v2(record, end)
                 if name:
                     record["顯示名稱"] = name
                     key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
                     MOPS_ENRICHMENTS[key] = {"display": name, "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", ""))}
+                    # 清掉並行階段對這筆的「查不到名稱」warning（已補查成功）
+                    warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "第幾次名稱" in w)]
             if need_purpose:
                 purpose = mops_funding_purpose(record, end)
                 if purpose:
                     record["本次籌資計畫"] = purpose
+                    warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "本次籌資計畫" in w)]
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
         require_purposes(records, purpose_keys)
