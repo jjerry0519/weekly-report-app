@@ -34,7 +34,7 @@ TEMPLATE_DIR = BASE_DIR / "templates"
 TEMPLATE_PATH = TEMPLATE_DIR / "同業送件明細樣板.xlsx"
 SFB_PAGE = "https://www.sfb.gov.tw/ch/home.jsp?id=1016&parentpath=0%2C6%2C52"
 ENABLE_ONLINE_MOPS_LOOKUP = os.environ.get("ENABLE_ONLINE_MOPS_LOOKUP", "1").lower() in {"1", "true", "yes", "on"}
-MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "10"))
+MAX_MOPS_WORKERS = int(os.environ.get("MAX_MOPS_WORKERS", "4"))
 
 COMPANY_TYPES = ("上市", "上櫃")
 CASE_KEYWORDS = (
@@ -595,14 +595,6 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
         end_params["year"] = f"{roc_year(end):03d}"
         end_params["month"] = f"{end.month:02d}"
         texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), end_params))
-
-    # For convertible/exchangeable bonds, the subject full-text search is the
-    # key source for resolving the ordinal name (第X次轉換公司債).
-    if classification in ("CB", "ECB", "EB"):
-        keyword = "交換公司債" if classification == "EB" else "轉換公司債"
-        texts.append(mops_subject_search_text(record, received, keyword))
-        if (roc_year(end), end.month) != (roc_year(received), received.month):
-            texts.append(mops_subject_search_text(record, end, keyword))
 
     texts.append(open_data_major_announcement_text(record))
     result = "\n".join(text for text in texts if text)
@@ -1191,37 +1183,51 @@ _PURPOSE_RE = re.compile(
 
 
 def _purpose_fetch(path_qs: str) -> str:
-    for host in ("https://mopsov.twse.com.tw", "https://mops.twse.com.tw"):
-        try:
-            text = public_fetch_text(host + path_qs, timeout=MOPS_TIMEOUT_SECONDS)
-            if text:
-                return text
-        except Exception:
-            continue
+    # MOPS 在高並行下會間歇 timeout，重試兩輪 + 較長 timeout 確保穩定抓到
+    for attempt in range(3):
+        for host in ("https://mopsov.twse.com.tw", "https://mops.twse.com.tw"):
+            try:
+                text = public_fetch_text(host + path_qs, timeout=6)
+                if text and len(text) > 200:
+                    return text
+            except Exception:
+                continue
     return ""
 
 
-def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
-    """從 MOPS 重大訊息『董事會決議辦理現增/發行轉換公司債』公告全文擷取資金用途。
+_RESOLUTION_CACHE: dict[tuple, list[tuple[str, str]]] = {}
 
-    董事會決議公告日通常早於收文日 1-4 個月，故往前回溯查找；找到對應標題後
-    以 step=2 抓公告全文，擷取資金用途段落。
+
+def _company_resolution_announcements(record: dict[str, str], end: dt.date) -> list[tuple[str, str]]:
+    """找該公司『董事會決議辦理現增/發行轉換公司債』公告，回傳 [(標題, 公告全文)]。
+
+    這是名稱（第X次）與籌資計畫的單一可靠來源——以 co_id 精準鎖定該公司，
+    避免主旨全文檢索抓到別家公司而張冠李戴。董事會決議日通常早於收文日 1-4 個月，
+    故往前回溯 5 個月查找。
     """
     co_id = record.get("證券代號", "")
     classification = record.get("分類", "")
     received = parse_date(record.get("收文日期", "")) or end
+    cache_key = (co_id, classification, received.year, received.month)
+    cached = _RESOLUTION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     typek = "sii" if "上市" in record.get("公司型態", "") else "otc"
     is_bond = classification in ("CB", "ECB", "EB")
 
     def title_matches(title: str) -> bool:
-        # 排除：減資、員工權利新股、對子公司增資、轉投資增資
-        if any(bad in title for bad in ("減資", "限制員工", "子公司", "轉投資")):
+        # 排除非「董事會決議發行」的後續公告（收足價款、掛牌、賣回、終止等無資金用途段落）
+        if any(bad in title for bad in ("減資", "限制員工", "子公司", "轉投資",
+                                         "收足", "掛牌", "賣回", "上市買賣", "終止", "代收", "存儲", "價款")):
+            return False
+        if "董事會" not in title:
             return False
         if is_bond:
-            return "轉換公司債" in title
-        # 現金增資：發行新股 或 發行普通股
+            return "轉換公司債" in title and ("發行" in title or "募集" in title)
         return "現金增資" in title and ("發行新股" in title or "發行普通股" in title)
 
+    results: list[tuple[str, str]] = []
     first = received.replace(day=1)
     for back in range(0, 5):
         month = first.month - back
@@ -1239,7 +1245,8 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
         if not raw:
             continue
         for match in re.finditer(r'onclick="([^"]*seq_no\.value[^"]+)"', raw):
-            title = html_to_text(raw[max(0, match.start() - 300):match.start()])
+            # MOPS 公告主旨常含換行，去除空白避免「轉換 公司債」斷字比對失敗
+            title = re.sub(r"\s+", "", html_to_text(raw[max(0, match.start() - 300):match.start()]))
             if not title_matches(title):
                 continue
             onclick = match.group(1)
@@ -1254,12 +1261,44 @@ def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
                 "spoke_date": field("spoke_date"), "firstin": "true",
             }
             detail = _purpose_fetch("/mops/web/ajax_t05st01?" + urllib.parse.urlencode(detail_params))
-            if not detail:
-                continue
-            found = _PURPOSE_RE.search(html_to_text(detail))
-            if found:
-                return re.sub(r"\s+", "", found.group(1)).strip("、,，;；")
+            if detail:
+                results.append((title, html_to_text(detail)))
+        if results:
+            break  # 最近月份找到即停，避免抓到更舊的同類公告
 
+    # 只快取非空結果：並行 timeout 的空結果不可快取，否則 sequential 補查會命中空 cache 而不重查
+    if results:
+        _RESOLUTION_CACHE[cache_key] = results
+    return results
+
+
+# 標題擷取本次發行序號，例如「發行國內第九次無擔保轉換公司債」-> 九
+_ORDINAL_IN_TITLE_RE = re.compile(
+    r"第\s*([一二三四五六七八九十百千\d]+)\s*次[^，。；]{0,12}(?:轉換公司債|交換公司債|公司債)"
+)
+
+
+def mops_bond_short_name_v2(record: dict[str, str], end: dt.date, company_short: str = "") -> str:
+    """從該公司董事會決議發行公告『標題』擷取第X次，組合債券簡稱（如 世紀鋼九、台燿ECB5）。"""
+    if record.get("分類") not in ("CB", "ECB", "EB"):
+        return ""
+    short = company_short or public_company_short_name(record.get("證券代號", "")) or record.get("公司名稱", "")
+    for title, _detail in _company_resolution_announcements(record, end):
+        m = _ORDINAL_IN_TITLE_RE.search(title)
+        if m:
+            ordinal = chinese_ordinal_to_short(m.group(1))
+            name = bond_name_with_ordinal(short, ordinal, record)
+            if name and is_bond_product_name(name):
+                return name
+    return ""
+
+
+def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
+    """從董事會決議公告全文擷取資金用途。"""
+    for _title, detail in _company_resolution_announcements(record, end):
+        found = _PURPOSE_RE.search(detail)
+        if found:
+            return re.sub(r"\s+", "", found.group(1)).strip("、,，;；")
     # Fallback: open-data summary
     return funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
 
@@ -1286,13 +1325,8 @@ def online_mops_lookup(record: dict[str, str], end: dt.date, need_company_short:
             result["company_short"] = short_name
             record["顯示名稱"] = short_name
 
-    # Fetch the base MOPS text once, reuse for both bond name and purpose
-    lookup_text = ""
-    if need_bond_name or need_purpose:
-        lookup_text = mops_official_lookup_text(record, end, include_bond=need_bond_name)
-
     if need_bond_name:
-        name = parse_bond_short_from_text(lookup_text, record, short_name) or parse_bond_short_from_announcement(lookup_text, record, short_name)
+        name = mops_bond_short_name_v2(record, end, short_name)
         if name:
             result["bond_name"] = name
             record["顯示名稱"] = name
@@ -1386,6 +1420,30 @@ def enrich_records(
                         "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", "")),
                     }
         resolve_missing_bond_names(records, end, focus_keys, warnings)
+        # Sequential 補查：MOPS 在並行下少數筆會間歇 timeout 或 detail 截斷。
+        # 對仍缺名稱/用途的筆，先清掉其快取強制重抓完整公告，無並行壓力下幾乎必成功。
+        for record in records:
+            rk = record_key(record)
+            if focus_keys is not None and rk not in focus_keys:
+                continue
+            need_bond = record.get("分類") in ("CB", "ECB", "EB") and not is_bond_product_name(record.get("顯示名稱", ""))
+            wants_purpose = purpose_keys is None or rk in purpose_keys
+            need_purpose = wants_purpose and not record.get("本次籌資計畫", "").strip()
+            if not need_bond and not need_purpose:
+                continue
+            # 清掉可能半殘的快取，強制重抓完整 detail
+            received = parse_date(record.get("收文日期", "")) or end
+            _RESOLUTION_CACHE.pop((record.get("證券代號", ""), record.get("分類", ""), received.year, received.month), None)
+            if need_bond:
+                name = mops_bond_short_name_v2(record, end)
+                if name:
+                    record["顯示名稱"] = name
+                    key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
+                    MOPS_ENRICHMENTS[key] = {"display": name, "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", ""))}
+            if need_purpose:
+                purpose = mops_funding_purpose(record, end)
+                if purpose:
+                    record["本次籌資計畫"] = purpose
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
         require_purposes(records, purpose_keys)
