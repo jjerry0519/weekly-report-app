@@ -564,10 +564,17 @@ def mops_subject_search_text(record: dict[str, str], date_value: dt.date, keywor
     return "\n".join(texts)
 
 
+_MOPS_LOOKUP_CACHE: dict[tuple, str] = {}
+
+
 def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond: bool = True) -> str:
     received = parse_date(record.get("收文日期", "")) or end
     co_id = record.get("證券代號", "")
     classification = record.get("分類", "")
+    cache_key = (co_id, classification, received.year, received.month, end.year, end.month, include_bond)
+    cached = _MOPS_LOOKUP_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     texts: list[str] = []
 
     # Primary: announcement list for received month (single call, 4 parallel requests)
@@ -589,8 +596,18 @@ def mops_official_lookup_text(record: dict[str, str], end: dt.date, include_bond
         end_params["month"] = f"{end.month:02d}"
         texts.append(mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), end_params))
 
+    # For convertible/exchangeable bonds, the subject full-text search is the
+    # key source for resolving the ordinal name (第X次轉換公司債).
+    if classification in ("CB", "ECB", "EB"):
+        keyword = "交換公司債" if classification == "EB" else "轉換公司債"
+        texts.append(mops_subject_search_text(record, received, keyword))
+        if (roc_year(end), end.month) != (roc_year(received), received.month):
+            texts.append(mops_subject_search_text(record, end, keyword))
+
     texts.append(open_data_major_announcement_text(record))
-    return "\n".join(text for text in texts if text)
+    result = "\n".join(text for text in texts if text)
+    _MOPS_LOOKUP_CACHE[cache_key] = result
+    return result
 
 
 def parse_bond_short_from_text(text: str, record: dict[str, str], company_short: str = "") -> str:
@@ -691,33 +708,61 @@ def open_data_major_announcement_text(record: dict[str, str]) -> str:
         "https://mopsfin.twse.com.tw/opendata/t187ap04_O.csv",
         "https://mopsfin.twse.com.tw/opendata/t187ap04_P.csv",
     )
+    all_rows = _load_open_data_rows(urls)
     security_code = record.get("證券代號", "")
+    tokens = record_identity_tokens(record)
     texts: list[str] = []
-    for url in urls:
-        try:
-            raw = public_fetch_text(url, timeout=3)
-        except Exception:
+    for code, joined, joined_norm in all_rows:
+        if code and code != security_code:
             continue
-        if not raw.strip():
-            continue
-        rows: list[dict[str, str]] = []
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                rows = [row for row in data if isinstance(row, dict)]
-        except Exception:
-            try:
-                rows = list(csv.DictReader(io.StringIO(raw)))
-            except Exception:
-                rows = []
-        for row in rows:
-            code = str(row.get("公司代號") or row.get("證券代號") or row.get("公司代號/股票代號") or row.get("Code") or "").strip()
-            if code and code != security_code:
-                continue
-            joined = " ".join(str(value) for value in row.values() if value is not None)
-            if security_code in joined or any(token in normalize_header(joined) for token in record_identity_tokens(record)):
-                texts.append(joined)
+        if security_code in joined or any(token in joined_norm for token in tokens):
+            texts.append(joined)
     return "\n".join(texts)
+
+
+_OPEN_DATA_ROWS: list[tuple[str, str, str]] | None = None
+_OPEN_DATA_LOCK = _threading_early.Lock()
+
+
+def _load_open_data_rows(urls: tuple[str, ...]) -> list[tuple[str, str, str]]:
+    """Download the market-wide open-data files once; cache parsed rows for all records."""
+    global _OPEN_DATA_ROWS
+    if _OPEN_DATA_ROWS is not None:
+        return _OPEN_DATA_ROWS
+    with _OPEN_DATA_LOCK:
+        if _OPEN_DATA_ROWS is not None:
+            return _OPEN_DATA_ROWS
+        seen_codes: set[str] = set()
+        parsed: list[tuple[str, str, str]] = []
+        for url in urls:
+            try:
+                raw = public_fetch_text(url, timeout=4)
+            except Exception:
+                continue
+            if not raw.strip():
+                continue
+            rows: list[dict[str, str]] = []
+            try:
+                data = json.loads(raw)
+                if isinstance(data, list):
+                    rows = [row for row in data if isinstance(row, dict)]
+            except Exception:
+                try:
+                    rows = list(csv.DictReader(io.StringIO(raw)))
+                except Exception:
+                    rows = []
+            if not rows:
+                continue
+            for row in rows:
+                code = str(row.get("公司代號") or row.get("證券代號") or row.get("公司代號/股票代號") or row.get("Code") or "").strip()
+                joined = " ".join(str(value) for value in row.values() if value is not None)
+                dedup = code + "|" + joined
+                if dedup in seen_codes:
+                    continue
+                seen_codes.add(dedup)
+                parsed.append((code, joined, normalize_header(joined)))
+        _OPEN_DATA_ROWS = parsed
+        return _OPEN_DATA_ROWS
 
 
 def text_matches_record(text: str, record: dict[str, str]) -> bool:
@@ -1137,34 +1182,86 @@ def parse_bond_short_from_announcement(text: str, record: dict[str, str], compan
     return ""
 
 
-def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
-    received = parse_date(record.get("收文日期", "")) or end
-    params = {
-        "encodeURIComponent": "1",
-        "step": "1",
-        "firstin": "1",
-        "TYPEK": "all",
-        "co_id": record.get("證券代號", ""),
-        "year": f"{roc_year(received):03d}",
-        "month": f"{received.month:02d}",
-    }
-    text = mops_query_text(("/mops/web/ajax_t05sr01_1", "/mops/web/t05sr01_1"), params)
-    matched_text = matching_record_text(text, record)
-    purpose = parse_purpose_from_text(matched_text)
-    if purpose:
-        return purpose
-    paths = ("/mops/web/ajax_t116sb01", "/mops/web/ajax_t108sb16")
-    text = mops_query_text(paths, params)
-    purpose = parse_purpose_from_text(matching_record_text(text, record))
-    if purpose:
-        return purpose
-    purpose = parse_purpose_from_text(matching_record_text(mops_major_announcement_text(record, end), record))
-    if purpose:
-        return purpose
-    purpose = funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
-    if purpose:
-        return purpose
+# 募資用途欄位名稱：CI 用「本次增資資金用途」，CB/ECB 用「募得價款之用途及運用計畫」
+_PURPOSE_RE = re.compile(
+    r"(?:本次增資資金用途|募得價款之用途及運用計畫|本次募集與發行資金用途|資金用途)[:：]\s*(.+?)"
+    r"(?=。|\s*1[0-9]\.|\s*[0-9]+\.\s*其他|以上資料)",
+    re.S,
+)
+
+
+def _purpose_fetch(path_qs: str) -> str:
+    for host in ("https://mopsov.twse.com.tw", "https://mops.twse.com.tw"):
+        try:
+            text = public_fetch_text(host + path_qs, timeout=MOPS_TIMEOUT_SECONDS)
+            if text:
+                return text
+        except Exception:
+            continue
     return ""
+
+
+def mops_funding_purpose(record: dict[str, str], end: dt.date) -> str:
+    """從 MOPS 重大訊息『董事會決議辦理現增/發行轉換公司債』公告全文擷取資金用途。
+
+    董事會決議公告日通常早於收文日 1-4 個月，故往前回溯查找；找到對應標題後
+    以 step=2 抓公告全文，擷取資金用途段落。
+    """
+    co_id = record.get("證券代號", "")
+    classification = record.get("分類", "")
+    received = parse_date(record.get("收文日期", "")) or end
+    typek = "sii" if "上市" in record.get("公司型態", "") else "otc"
+    is_bond = classification in ("CB", "ECB", "EB")
+
+    def title_matches(title: str) -> bool:
+        # 排除：減資、員工權利新股、對子公司增資、轉投資增資
+        if any(bad in title for bad in ("減資", "限制員工", "子公司", "轉投資")):
+            return False
+        if is_bond:
+            return "轉換公司債" in title
+        # 現金增資：發行新股 或 發行普通股
+        return "現金增資" in title and ("發行新股" in title or "發行普通股" in title)
+
+    first = received.replace(day=1)
+    for back in range(0, 5):
+        month = first.month - back
+        year = first.year
+        while month <= 0:
+            month += 12
+            year -= 1
+        params = {
+            "encodeURIComponent": "1", "step": "1", "firstin": "true", "off": "1",
+            "TYPEK": typek, "co_id": co_id,
+            "year": f"{year - 1911:03d}", "month": f"{month:02d}",
+            "b_date": "1", "e_date": "31",
+        }
+        raw = _purpose_fetch("/mops/web/ajax_t05st01?" + urllib.parse.urlencode(params))
+        if not raw:
+            continue
+        for match in re.finditer(r'onclick="([^"]*seq_no\.value[^"]+)"', raw):
+            title = html_to_text(raw[max(0, match.start() - 300):match.start()])
+            if not title_matches(title):
+                continue
+            onclick = match.group(1)
+
+            def field(name: str) -> str:
+                found = re.search(name + r"\.value='([^']*)'", onclick)
+                return found.group(1) if found else ""
+
+            detail_params = {
+                "step": "2", "TYPEK": field("TYPEK") or typek, "co_id": co_id,
+                "seq_no": field("seq_no"), "spoke_time": field("spoke_time"),
+                "spoke_date": field("spoke_date"), "firstin": "true",
+            }
+            detail = _purpose_fetch("/mops/web/ajax_t05st01?" + urllib.parse.urlencode(detail_params))
+            if not detail:
+                continue
+            found = _PURPOSE_RE.search(html_to_text(detail))
+            if found:
+                return re.sub(r"\s+", "", found.group(1)).strip("、,，;；")
+
+    # Fallback: open-data summary
+    return funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
 
 
 def display_name_for_record(record: dict[str, str]) -> str:
@@ -1201,9 +1298,7 @@ def online_mops_lookup(record: dict[str, str], end: dt.date, need_company_short:
             record["顯示名稱"] = name
 
     if need_purpose:
-        purpose = parse_purpose_from_text(matching_record_text(lookup_text, record))
-        if not purpose:
-            purpose = funding_purpose_from_open_text(record, open_data_major_announcement_text(record))
+        purpose = mops_funding_purpose(record, end)
         if purpose:
             result["purpose"] = purpose
     return result
