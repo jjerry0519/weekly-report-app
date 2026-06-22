@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time as _time
 import urllib.parse
 import urllib.request
 import zipfile
@@ -1431,23 +1432,29 @@ def enrich_records(
             need_purpose = wants_purpose and not record.get("本次籌資計畫", "").strip()
             if not need_bond and not need_purpose:
                 continue
-            # 清掉可能半殘的快取，強制重抓完整 detail
             received = parse_date(record.get("收文日期", "")) or end
-            _RESOLUTION_CACHE.pop((record.get("證券代號", ""), record.get("分類", ""), received.year, received.month), None)
             code = record.get("證券代號", "")
-            if need_bond:
-                name = mops_bond_short_name_v2(record, end)
-                if name:
-                    record["顯示名稱"] = name
-                    key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
-                    MOPS_ENRICHMENTS[key] = {"display": name, "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", ""))}
-                    # 清掉並行階段對這筆的「查不到名稱」warning（已補查成功）
-                    warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "第幾次名稱" in w)]
-            if need_purpose:
-                purpose = mops_funding_purpose(record, end)
-                if purpose:
-                    record["本次籌資計畫"] = purpose
-                    warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "本次籌資計畫" in w)]
+            cache_key = (record.get("證券代號", ""), record.get("分類", ""), received.year, received.month)
+            # 線上 Render 固定 IP 易被 MOPS 短時限流。對仍缺的筆帶間隔重試，熬過限流窗口。
+            for attempt in range(5):
+                _RESOLUTION_CACHE.pop(cache_key, None)  # 清半殘快取強制重抓
+                if need_bond:
+                    name = mops_bond_short_name_v2(record, end)
+                    if name:
+                        record["顯示名稱"] = name
+                        key = (record.get("證券代號", ""), record.get("分類", ""), record.get("金額", ""))
+                        MOPS_ENRICHMENTS[key] = {"display": name, "purpose": record.get("本次籌資計畫", MOPS_ENRICHMENTS.get(key, {}).get("purpose", ""))}
+                        warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "第幾次名稱" in w)]
+                        need_bond = False
+                if need_purpose:
+                    purpose = mops_funding_purpose(record, end)
+                    if purpose:
+                        record["本次籌資計畫"] = purpose
+                        warnings[:] = [w for w in warnings if not (w.split("：")[0].split()[0] == code and "本次籌資計畫" in w)]
+                        need_purpose = False
+                if not need_bond and not need_purpose:
+                    break
+                _time.sleep(3)  # 等 MOPS 限流窗口恢復後再試
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
         require_purposes(records, purpose_keys)
