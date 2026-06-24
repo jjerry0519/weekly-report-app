@@ -1049,6 +1049,44 @@ def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focu
                 record["顯示名稱"] = stock_display_name(record)
 
 
+def reassign_multi_bond_ordinals(records: list[dict[str, str]], end: dt.date, focus_keys: set[str] | None, warnings: list[str]) -> None:
+    """同公司同次申報多檔 CB（常以一則『第X次暨第Y次』公告宣布）時，
+    序號擷取易把多筆都標成第一個序號。收集該公司所有公告序號，按申報順序
+    分配不重複序號，僅在目前序號有重複時才覆寫（不動已正確分配的）。"""
+    groups: dict[tuple, list[dict[str, str]]] = {}
+    for record in records:
+        if record.get("分類") not in ("CB", "ECB", "EB"):
+            continue
+        if focus_keys is not None and record_key(record) not in focus_keys:
+            continue
+        groups.setdefault((record.get("證券代號", ""), record.get("分類", "")), []).append(record)
+    for (code, _cls), group in groups.items():
+        if len(group) < 2:
+            continue
+        current = [bond_product_ordinal(r.get("顯示名稱", "")) for r in group]
+        if len(set(current)) >= len(group):
+            continue  # 序號已各不相同，視為正確，不動
+        ordinals: list[str] = []
+        for title, _detail in _company_resolution_announcements(group[0], end):
+            compact = re.sub(r"\s+", "", title)
+            for raw in re.findall(r"第([一二三四五六七八九十百\d]+)次", compact):
+                ordinal = chinese_ordinal_to_short(raw)
+                if ordinal not in ordinals:
+                    ordinals.append(ordinal)
+        ordinals = sorted(set(ordinals), key=lambda o: (ordinal_to_int(o) or 999))
+        if len(ordinals) < len(group):
+            continue  # 序號不足，保留現狀（避免亂猜）
+        short = public_company_short_name(code) or normalize_stock_short_for_bond(group[0].get("公司名稱", ""))
+        for record, ordinal in zip(group, ordinals[:len(group)]):
+            name = bond_name_with_ordinal(short, ordinal, record)
+            if name and is_bond_product_name(name):
+                record["顯示名稱"] = name
+        warnings.append(
+            f"{code} {group[0].get('公司名稱')}：同次申報多檔轉換公司債（第{'、'.join(ordinals[:len(group)])}次），"
+            f"序號依申報順序對應，請人工確認各檔對應金額。"
+        )
+
+
 def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
     for record in records:
         if focus_keys is not None and record_key(record) not in focus_keys:
@@ -1455,6 +1493,7 @@ def enrich_records(
                 if not need_bond and not need_purpose:
                     break
                 _time.sleep(3)  # 等 MOPS 限流窗口恢復後再試
+        reassign_multi_bond_ordinals(records, end, focus_keys, warnings)
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
         require_purposes(records, purpose_keys)
