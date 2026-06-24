@@ -2727,10 +2727,13 @@ def update_summary_sheet_openpyxl(
     sheet["BB1"] = f"更新日期：{roc_date(end)}"
     sheet["AX2"] = f"{roc_year(end)}.01.01~{roc_date(end)}"
     broker_rows: dict[str, int] = {}
+    broker_orig: dict[str, str] = {}  # normalized -> 樣板原始承銷商名（供排序後寫回 A 欄）
     for row_num in range(4, sheet.max_row + 1):
-        broker = normalize_broker(str(sheet.cell(row_num, 1).value or ""))
+        raw_name = str(sheet.cell(row_num, 1).value or "")
+        broker = normalize_broker(raw_name)
         if broker:
             broker_rows[broker] = row_num
+            broker_orig[broker] = clean_broker(raw_name)
 
     year_records = [r for r in base_records if (parse_date(r.get("收文日期", "")) or start) <= end]
     by_broker: dict[str, dict[str, list[str]]] = {}
@@ -2757,10 +2760,15 @@ def update_summary_sheet_openpyxl(
         name = record.get("顯示名稱") or record.get("公司名稱", "")
         weekly_by_broker[broker][code].append(name)
 
-    for broker, code_map in by_broker.items():
-        if broker not in broker_rows or broker == "合計":
-            continue
-        row_num = broker_rows[broker]
+    # 有送件的承銷商按件數由高到低排序，填入它們原本佔用的列（列位置/格式不變，內容降序對應）
+    data_brokers = [
+        (broker, code_map) for broker, code_map in by_broker.items()
+        if broker in broker_rows and broker != "合計"
+    ]
+    data_brokers.sort(key=lambda item: sum(len(v) for v in item[1].values()), reverse=True)
+    target_rows = sorted(broker_rows[broker] for broker, _ in data_brokers)
+    for (broker, code_map), row_num in zip(data_brokers, target_rows):
+        sheet.cell(row_num, 1).value = broker_orig.get(broker, broker)
         total = sum(len(items) for items in code_map.values())
         sheet.cell(row_num, 50).value = total
         for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
