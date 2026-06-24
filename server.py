@@ -1049,10 +1049,44 @@ def resolve_missing_bond_names(records: list[dict[str, str]], end: dt.date, focu
                 record["顯示名稱"] = stock_display_name(record)
 
 
+_CN_DIGITS = {
+    "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    "壹": 1, "貳": 2, "參": 3, "叄": 3, "肆": 4, "伍": 5, "陸": 6, "柒": 7, "捌": 8, "玖": 9, "兩": 2,
+}
+
+
+def _parse_yi(text: str) -> int:
+    """解析億位數字（阿拉伯或中文大寫），如 '15'->15、'伍'->5、'貳拾'->20、'壹拾伍'->15。"""
+    text = text.strip()
+    if text.isdigit():
+        return int(text)
+    if "拾" in text or "十" in text:
+        parts = re.split(r"[拾十]", text)
+        tens = _CN_DIGITS.get(parts[0], 1) if parts[0] else 1
+        ones = _CN_DIGITS.get(parts[1], 0) if len(parts) > 1 and parts[1] else 0
+        return tens * 10 + ones
+    return _CN_DIGITS.get(text, 0)
+
+
+def _ordinal_amounts(detail: str) -> dict[str, int]:
+    """從公告 detail『發行總額』段落抓 {序號: 發行金額(元)}。
+    僅在各次金額分列時有效；若為『第三、四次...合計』則抓不到（回空）。"""
+    amounts: dict[str, int] = {}
+    for match in re.finditer(
+        r"第([一二三四五六七八九十百\d]+)次[^第]*?新台幣([零壹貳參叄肆伍陸柒捌玖拾佰兩一二三四五六七八九十\d]+)億",
+        detail,
+    ):
+        ordinal = chinese_ordinal_to_short(match.group(1))
+        yi = _parse_yi(match.group(2))
+        if ordinal and yi and ordinal not in amounts:
+            amounts[ordinal] = yi * 100000000
+    return amounts
+
+
 def reassign_multi_bond_ordinals(records: list[dict[str, str]], end: dt.date, focus_keys: set[str] | None, warnings: list[str]) -> None:
-    """同公司同次申報多檔 CB（常以一則『第X次暨第Y次』公告宣布）時，
-    序號擷取易把多筆都標成第一個序號。收集該公司所有公告序號，按申報順序
-    分配不重複序號，僅在目前序號有重複時才覆寫（不動已正確分配的）。"""
+    """同公司同次申報多檔 CB（常以一則『第X次暨第Y次』公告宣布）時，序號擷取易把
+    多筆都標成第一個序號。優先用各檔發行金額與公告金額精準對應；金額對不上的剩餘
+    檔再按申報順序補序號並加警示。僅在目前序號有重複時才覆寫（不動已正確的）。"""
     groups: dict[tuple, list[dict[str, str]]] = {}
     for record in records:
         if record.get("分類") not in ("CB", "ECB", "EB"):
@@ -1067,24 +1101,46 @@ def reassign_multi_bond_ordinals(records: list[dict[str, str]], end: dt.date, fo
         if len(set(current)) >= len(group):
             continue  # 序號已各不相同，視為正確，不動
         ordinals: list[str] = []
-        for title, _detail in _company_resolution_announcements(group[0], end):
+        amounts: dict[str, int] = {}
+        for title, detail in _company_resolution_announcements(group[0], end):
             compact = re.sub(r"\s+", "", title)
             for raw in re.findall(r"第([一二三四五六七八九十百\d]+)次", compact):
                 ordinal = chinese_ordinal_to_short(raw)
                 if ordinal not in ordinals:
                     ordinals.append(ordinal)
+            amounts.update(_ordinal_amounts(detail))
         ordinals = sorted(set(ordinals), key=lambda o: (ordinal_to_int(o) or 999))
         if len(ordinals) < len(group):
             continue  # 序號不足，保留現狀（避免亂猜）
         short = public_company_short_name(code) or normalize_stock_short_for_bond(group[0].get("公司名稱", ""))
-        for record, ordinal in zip(group, ordinals[:len(group)]):
+        # 第一輪：用發行金額精準對應序號
+        available = ordinals[:]
+        assigned: dict[int, str] = {}
+        unmatched: list[dict[str, str]] = []
+        for record in group:
+            amount = int(re.sub(r"\D", "", record.get("金額", "0")) or 0)
+            hit = next((o for o in available if amounts.get(o) == amount), None)
+            if hit:
+                assigned[id(record)] = hit
+                available.remove(hit)
+            else:
+                unmatched.append(record)
+        # 第二輪：剩餘檔按申報順序補剩餘序號
+        for record, ordinal in zip(unmatched, available):
+            assigned[id(record)] = ordinal
+        for record in group:
+            ordinal = assigned.get(id(record))
+            if not ordinal:
+                continue
             name = bond_name_with_ordinal(short, ordinal, record)
             if name and is_bond_product_name(name):
                 record["顯示名稱"] = name
-        warnings.append(
-            f"{code} {group[0].get('公司名稱')}：同次申報多檔轉換公司債（第{'、'.join(ordinals[:len(group)])}次），"
-            f"序號依申報順序對應，請人工確認各檔對應金額。"
-        )
+        if unmatched:
+            unmatched_ords = "、".join(assigned[id(r)] for r in unmatched if assigned.get(id(r)))
+            warnings.append(
+                f"{code} {group[0].get('公司名稱')}：多檔轉換公司債部分序號無法由發行金額精準對應"
+                f"（第{unmatched_ords}次依申報順序推定），請人工確認。"
+            )
 
 
 def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
