@@ -1117,8 +1117,10 @@ def reassign_multi_bond_ordinals(records: list[dict[str, str]], end: dt.date, fo
                         ordinals.append(ordinal)
                 amounts.update(_ordinal_amounts(detail))
             uniq = sorted(set(ordinals), key=lambda o: (ordinal_to_int(o) or 999))
-            # 序號足夠且每筆金額都能對應 → 完整，停止重試
-            if len(uniq) >= len(group) and group_amounts.issubset(set(amounts.values())):
+            # 序號足夠，且 detail 已抓到金額資料（amounts 非空）即停止重試。
+            # 金額對不上多為公告格式（合計/競價底標），重試也無用；只有 detail 完全
+            # 抓不到（限流，amounts 為空）才值得重試熬過限流窗口。
+            if len(uniq) >= len(group) and (amounts or attempt >= 5):
                 ordinals = uniq
                 break
             if attempt < 5:
