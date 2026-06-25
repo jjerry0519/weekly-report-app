@@ -1171,8 +1171,8 @@ def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[
             record["顯示名稱"] = stock_display_name(record)
 
 
-def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
-    missing: list[str] = []
+def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | None, warnings: list[str]) -> None:
+    # 查不到第幾次名稱者留白 + 警示（不中斷產出；留白不會填錯，請人工補）
     for record in records:
         if record.get("分類") not in ("CB", "ECB", "EB"):
             continue
@@ -1180,29 +1180,21 @@ def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | Non
             continue
         if is_bond_product_name(record.get("顯示名稱", "")):
             continue
-        missing.append(
-            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
-            f"{record.get('案件類別', '')} {record.get('金額', '')} "
-            f"收文{record.get('收文日期', '')}"
-        )
-    if missing:
-        raise ValueError("MOPS 第幾次發行查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
+        code = record.get("證券代號", "")
+        if not any(w.split("：")[0].split()[0] == code and "第幾次名稱" in w for w in warnings):
+            warnings.append(f"{code} {record.get('公司名稱', '')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱，已留白請人工確認。")
 
 
-def require_purposes(records: list[dict[str, str]], focus_keys: set[str] | None) -> None:
-    missing: list[str] = []
+def require_purposes(records: list[dict[str, str]], focus_keys: set[str] | None, warnings: list[str]) -> None:
+    # 查不到本次籌資計畫者留白 + 警示（不中斷產出；留白不會填錯，請人工補）
     for record in records:
         if focus_keys is not None and record_key(record) not in focus_keys:
             continue
         if record.get("本次籌資計畫", "").strip():
             continue
-        missing.append(
-            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
-            f"{record.get('案件類別', '')} {record.get('金額', '')} "
-            f"收文{record.get('收文日期', '')}"
-        )
-    if missing:
-        raise ValueError("MOPS 本次籌資計畫原因查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
+        code = record.get("證券代號", "")
+        if not any(w.split("：")[0].split()[0] == code and "本次籌資計畫" in w for w in warnings):
+            warnings.append(f"{code} {record.get('公司名稱', '')}：MOPS 查不到本次籌資計畫，已留白請人工確認。")
 
 
 def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
@@ -1337,7 +1329,10 @@ def _company_resolution_announcements(record: dict[str, str], end: dt.date) -> l
             return False
         if is_bond:
             return "轉換公司債" in title and ("發行" in title or "募集" in title)
-        return "現金增資" in title and ("發行新股" in title or "發行普通股" in title)
+        # 現金增資可發行普通股、新股或特別股（如「現金增資發行乙種可轉換特別股」）
+        return "現金增資" in title and "發行" in title and any(
+            kw in title for kw in ("新股", "普通股", "特別股")
+        )
 
     results: list[tuple[str, str]] = []
     first = received.replace(day=1)
@@ -1589,8 +1584,8 @@ def enrich_records(
                 _time.sleep(min(4 * (2 ** attempt), 40))  # 指數退避，等 MOPS 限流窗口恢復
         reassign_multi_bond_ordinals(records, end, focus_keys, warnings)
         normalize_weekly_stock_names(records, focus_keys)
-        require_bond_names(records, focus_keys)
-        require_purposes(records, purpose_keys)
+        require_bond_names(records, focus_keys, warnings)
+        require_purposes(records, purpose_keys, warnings)
         _save_bond_cache()
     return warnings
 
