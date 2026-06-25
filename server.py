@@ -1338,11 +1338,11 @@ def _company_resolution_announcements(record: dict[str, str], end: dt.date) -> l
         if "董事會" not in title:
             return False
         if is_bond:
-            return "轉換公司債" in title and ("發行" in title or "募集" in title)
-        # 現金增資可發行普通股、新股或特別股（如「現金增資發行乙種可轉換特別股」）
-        return "現金增資" in title and "發行" in title and any(
-            kw in title for kw in ("新股", "普通股", "特別股")
-        )
+            # 涵蓋轉換公司債(CB/ECB)與交換公司債(EB)，不論國內/海外、有無擔保
+            return ("轉換公司債" in title or "交換公司債" in title) and ("發行" in title or "募集" in title)
+        # 現金增資：不限發行何種股別（普通股/新股/特別股/可轉換特別股…），
+        # 用「現金增資 + 發行」通用判斷，不再逐一列舉股別（避免新股別漏接）
+        return "現金增資" in title and "發行" in title
 
     results: list[tuple[str, str]] = []
     first = received.replace(day=1)
