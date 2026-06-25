@@ -1389,11 +1389,31 @@ _ORDINAL_IN_TITLE_RE = re.compile(
 
 
 def mops_bond_short_name_v2(record: dict[str, str], end: dt.date, company_short: str = "") -> str:
-    """從該公司董事會決議發行公告『標題』擷取第X次，組合債券簡稱（如 世紀鋼九、台燿ECB5）。"""
+    """決定該檔 CB/ECB 的『第X次』名稱。
+
+    優先：用申報金額（來源 Excel，可靠）對應公告『發行總額』中各次的金額——
+    可確認次數正確，並避免抓到同公司其他次的舊發行公告。
+    金額對不上（公告只給合計、或為競價底標）時，退回以最近一則發行公告標題的序號。
+    """
     if record.get("分類") not in ("CB", "ECB", "EB"):
         return ""
     short = company_short or public_company_short_name(record.get("證券代號", "")) or record.get("公司名稱", "")
-    for title, _detail in _company_resolution_announcements(record, end):
+    announcements = _company_resolution_announcements(record, end)
+
+    # 1) 金額精準對應：申報金額 == 公告某次發行金額 → 採用該次
+    amount = int(re.sub(r"\D", "", record.get("金額", "0")) or 0)
+    if amount:
+        amounts: dict[str, int] = {}
+        for _title, detail in announcements:
+            amounts.update(_ordinal_amounts(detail))
+        matched = [ordinal for ordinal, value in amounts.items() if value == amount]
+        if len(matched) == 1:
+            name = bond_name_with_ordinal(short, matched[0], record)
+            if name and is_bond_product_name(name):
+                return name
+
+    # 2) 退回：最近一則發行公告標題的序號
+    for title, _detail in announcements:
         m = _ORDINAL_IN_TITLE_RE.search(title)
         if m:
             ordinal = chinese_ordinal_to_short(m.group(1))
