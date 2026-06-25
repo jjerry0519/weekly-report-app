@@ -2859,15 +2859,26 @@ def update_summary_sheet_openpyxl(
         name = record.get("顯示名稱") or record.get("公司名稱", "")
         weekly_by_broker[broker][code].append(name)
 
-    # 有送件的承銷商按件數由高到低排序，填入它們原本佔用的列（列位置/格式不變，內容降序對應）
+    # 承銷商重排：有送件者依件數由高到低集中於前段連續列，沒送件者往後（保留名稱、件數與明細清空）
     data_brokers = [
         (broker, code_map) for broker, code_map in by_broker.items()
         if broker in broker_rows and broker != "合計"
     ]
     data_brokers.sort(key=lambda item: sum(len(v) for v in item[1].values()), reverse=True)
-    target_rows = sorted(broker_rows[broker] for broker, _ in data_brokers)
-    for (broker, code_map), row_num in zip(data_brokers, target_rows):
+    data_set = {broker for broker, _ in data_brokers}
+    no_data_brokers = [
+        broker for broker, _ in sorted(broker_rows.items(), key=lambda kv: kv[1])
+        if broker != "合計" and broker not in data_set
+    ]
+    all_data_rows = sorted(row for broker, row in broker_rows.items() if broker != "合計")
+    ordered = data_brokers + [(broker, None) for broker in no_data_brokers]
+    for (broker, code_map), row_num in zip(ordered, all_data_rows):
         sheet.cell(row_num, 1).value = broker_orig.get(broker, broker)
+        if code_map is None:  # 沒送件：清空件數與各類別明細
+            sheet.cell(row_num, 50).value = None
+            for col_idx in OPENPYXL_SUMMARY_COLUMNS.values():
+                sheet.cell(row_num, col_idx).value = None
+            continue
         total = sum(len(items) for items in code_map.values())
         sheet.cell(row_num, 50).value = total
         for code, col_idx in OPENPYXL_SUMMARY_COLUMNS.items():
