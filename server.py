@@ -1100,15 +1100,30 @@ def reassign_multi_bond_ordinals(records: list[dict[str, str]], end: dt.date, fo
         current = [bond_product_ordinal(r.get("顯示名稱", "")) for r in group]
         if len(set(current)) >= len(group):
             continue  # 序號已各不相同，視為正確，不動
+        received0 = parse_date(group[0].get("收文日期", "")) or end
+        cache_key0 = (group[0].get("證券代號", ""), group[0].get("分類", ""), received0.year, received0.month)
+        group_amounts = {int(re.sub(r"\D", "", r.get("金額", "0")) or 0) for r in group}
         ordinals: list[str] = []
         amounts: dict[str, int] = {}
-        for title, detail in _company_resolution_announcements(group[0], end):
-            compact = re.sub(r"\s+", "", title)
-            for raw in re.findall(r"第([一二三四五六七八九十百\d]+)次", compact):
-                ordinal = chinese_ordinal_to_short(raw)
-                if ordinal not in ordinals:
-                    ordinals.append(ordinal)
-            amounts.update(_ordinal_amounts(detail))
+        # 線上限流時 detail 金額可能抓不全，帶指數退避重試直到序號＋金額皆完整
+        for attempt in range(6):
+            ordinals = []
+            amounts = {}
+            for title, detail in _company_resolution_announcements(group[0], end):
+                compact = re.sub(r"\s+", "", title)
+                for raw in re.findall(r"第([一二三四五六七八九十百\d]+)次", compact):
+                    ordinal = chinese_ordinal_to_short(raw)
+                    if ordinal not in ordinals:
+                        ordinals.append(ordinal)
+                amounts.update(_ordinal_amounts(detail))
+            uniq = sorted(set(ordinals), key=lambda o: (ordinal_to_int(o) or 999))
+            # 序號足夠且每筆金額都能對應 → 完整，停止重試
+            if len(uniq) >= len(group) and group_amounts.issubset(set(amounts.values())):
+                ordinals = uniq
+                break
+            if attempt < 5:
+                _RESOLUTION_CACHE.pop(cache_key0, None)
+                _time.sleep(min(4 * (2 ** attempt), 40))
         ordinals = sorted(set(ordinals), key=lambda o: (ordinal_to_int(o) or 999))
         if len(ordinals) < len(group):
             continue  # 序號不足，保留現狀（避免亂猜）
@@ -1529,8 +1544,9 @@ def enrich_records(
             received = parse_date(record.get("收文日期", "")) or end
             code = record.get("證券代號", "")
             cache_key = (record.get("證券代號", ""), record.get("分類", ""), received.year, received.month)
-            # 線上 Render 固定 IP 易被 MOPS 短時限流。對仍缺的筆帶間隔重試，熬過限流窗口。
-            for attempt in range(5):
+            # 線上 Render 固定 IP 易被 MOPS 短時限流。對仍缺的筆帶「指數退避」重試，
+            # 給限流窗口足夠恢復時間（4→8→16→32→40→40→40 秒），確保該查到的最終都查到。
+            for attempt in range(7):
                 _RESOLUTION_CACHE.pop(cache_key, None)  # 清半殘快取強制重抓
                 if need_bond:
                     name = mops_bond_short_name_v2(record, end)
@@ -1548,7 +1564,7 @@ def enrich_records(
                         need_purpose = False
                 if not need_bond and not need_purpose:
                     break
-                _time.sleep(3)  # 等 MOPS 限流窗口恢復後再試
+                _time.sleep(min(4 * (2 ** attempt), 40))  # 指數退避，等 MOPS 限流窗口恢復
         reassign_multi_bond_ordinals(records, end, focus_keys, warnings)
         normalize_weekly_stock_names(records, focus_keys)
         require_bond_names(records, focus_keys)
