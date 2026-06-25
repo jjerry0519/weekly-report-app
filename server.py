@@ -1172,7 +1172,8 @@ def normalize_weekly_stock_names(records: list[dict[str, str]], focus_keys: set[
 
 
 def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | None, warnings: list[str]) -> None:
-    # 查不到第幾次名稱者留白 + 警示（不中斷產出；留白不會填錯，請人工補）
+    # 能上申報彙總表的案件 MOPS 必有公告，查不到代表程式有未處理的情況 → 中斷暴露問題去修
+    missing: list[str] = []
     for record in records:
         if record.get("分類") not in ("CB", "ECB", "EB"):
             continue
@@ -1180,21 +1181,30 @@ def require_bond_names(records: list[dict[str, str]], focus_keys: set[str] | Non
             continue
         if is_bond_product_name(record.get("顯示名稱", "")):
             continue
-        code = record.get("證券代號", "")
-        if not any(w.split("：")[0].split()[0] == code and "第幾次名稱" in w for w in warnings):
-            warnings.append(f"{code} {record.get('公司名稱', '')}：MOPS 查不到可確認的 CB/ECB 第幾次名稱，已留白請人工確認。")
+        missing.append(
+            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
+            f"{record.get('案件類別', '')} {record.get('金額', '')} "
+            f"收文{record.get('收文日期', '')}"
+        )
+    if missing:
+        raise ValueError("MOPS 第幾次發行查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
 
 
 def require_purposes(records: list[dict[str, str]], focus_keys: set[str] | None, warnings: list[str]) -> None:
-    # 查不到本次籌資計畫者留白 + 警示（不中斷產出；留白不會填錯，請人工補）
+    # 能上申報彙總表的案件 MOPS 必有公告，查不到代表程式有未處理的情況 → 中斷暴露問題去修
+    missing: list[str] = []
     for record in records:
         if focus_keys is not None and record_key(record) not in focus_keys:
             continue
         if record.get("本次籌資計畫", "").strip():
             continue
-        code = record.get("證券代號", "")
-        if not any(w.split("：")[0].split()[0] == code and "本次籌資計畫" in w for w in warnings):
-            warnings.append(f"{code} {record.get('公司名稱', '')}：MOPS 查不到本次籌資計畫，已留白請人工確認。")
+        missing.append(
+            f"{record.get('證券代號', '')} {record.get('公司名稱', '')} "
+            f"{record.get('案件類別', '')} {record.get('金額', '')} "
+            f"收文{record.get('收文日期', '')}"
+        )
+    if missing:
+        raise ValueError("MOPS 本次籌資計畫原因查詢未完成，已停止產出避免錯檔：\n" + "\n".join(missing))
 
 
 def complete_ordinals(ordinals: list[str], count: int) -> list[str]:
